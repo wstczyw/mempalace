@@ -2056,3 +2056,24 @@ def test_bind_does_not_resolve_the_address_back_to_a_name(monkeypatch):
         assert httpd.server_port != 0
     finally:
         httpd.server_close()
+
+
+def test_server_discover_skips_the_palace_request_lock():
+    """MCP 2026-07-28 clients probe server/discover before falling back to
+    initialize. While a palace write holds the exclusive request lock the probe
+    must still answer at once; it used to queue until client startup timeouts."""
+    mcp._HTTP_REQUEST_LOCK.acquire_write()
+    result = {}
+    worker = threading.Thread(
+        target=lambda: result.update(
+            mcp._http_dispatch({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        )
+    )
+    try:
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive(), "server/discover queued behind the palace write lock"
+    finally:
+        mcp._HTTP_REQUEST_LOCK.release_write()
+        worker.join(timeout=5)
+    assert result["error"]["code"] == -32601
