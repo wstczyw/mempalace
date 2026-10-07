@@ -50,6 +50,7 @@ from .timeutil import utc_now, utc_now_iso
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
+HUB_JOB_TIMEOUT = 60.0 * 60.0
 # Liveness-probe timeout for the hook "is a daemon already running?" precheck.
 # 0.15s stays well under the 500ms hook budget: a wedged daemon must not
 # consume the whole budget before the hook falls back. A healthy local daemon
@@ -630,10 +631,88 @@ def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
     return out
 
 
+@dataclass(frozen=True)
+class HubJobProxy:
+    base_url: str
+    token: str
+    pid: int
+
+
+def _discover_hub_job_proxy(palace_path: str) -> HubJobProxy | None:
+    """Return a verified writable local Hub that accepts exact daemon jobs."""
+    from . import server_registry
+
+    info = server_registry.read_live_serverinfo(palace_path)
+    if not info or info.get("read_only") or info.get("pid") == os.getpid():
+        return None
+    tokens = server_registry.load_server_tokens(palace_path) or ("",)
+    base_url = server_registry.client_base_url(info)
+    for token in tokens:
+        request = urlrequest.Request(
+            f"{base_url}/internal/daemon-job/health",
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+        )
+        try:
+            with urlrequest.urlopen(request, timeout=HOOK_PROBE_TIMEOUT) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            if exc.code == 401:
+                exc.close()
+                continue
+            return None
+        except (urlerror.URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            return None
+        if response.status == 200 and payload.get("execution_owner") == "hub":
+            return HubJobProxy(base_url=base_url, token=token, pid=int(info["pid"]))
+        return None
+    return None
+
+
+def _forward_job_to_hub(target: HubJobProxy, kind: str, payload: dict[str, Any]) -> dict:
+    """Execute one queued job in the Hub process without local fallback."""
+    body = json.dumps({"kind": kind, "payload": payload}, ensure_ascii=False).encode("utf-8")
+    request = urlrequest.Request(
+        f"{target.base_url}/internal/daemon-job",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {target.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=HUB_JOB_TIMEOUT) as response:
+            envelope = json.loads(response.read().decode("utf-8"))
+    except urlerror.HTTPError as exc:
+        return {
+            "success": False,
+            "exit_code": 1,
+            "error": f"palace Hub rejected daemon job: HTTP {exc.code}",
+        }
+    except (urlerror.URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "success": False,
+            "exit_code": 1,
+            "error": (
+                f"palace Hub did not complete daemon job: {exc}; not replaying locally "
+                "because the Hub may already have accepted the write"
+            ),
+        }
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, dict):
+        return {"success": False, "exit_code": 1, "error": "invalid palace Hub job response"}
+    return result
+
+
 class DaemonRuntime:
-    def __init__(self, palace_path: str, backend: str | None = None):
+    def __init__(
+        self,
+        palace_path: str,
+        backend: str | None = None,
+        hub_proxy: HubJobProxy | None = None,
+    ):
         self.palace_path = canonical_palace_path(palace_path)
         self.backend = backend
+        self.hub_proxy = hub_proxy
         self.store = QueueStore(queue_path(self.palace_path))
         self.shutdown_event = threading.Event()
         self.worker_wake = threading.Event()
@@ -716,7 +795,13 @@ class DaemonRuntime:
                 payload["palace_path"] = self.palace_path
                 if self.backend:
                     payload["backend"] = self.backend
-                result = execute_job(job.kind, payload)
+                if self.hub_proxy is not None:
+                    fresh_proxy = _discover_hub_job_proxy(self.palace_path)
+                    if fresh_proxy is not None:
+                        self.hub_proxy = fresh_proxy
+                    result = _forward_job_to_hub(self.hub_proxy, job.kind, payload)
+                else:
+                    result = execute_job(job.kind, payload)
                 ok = bool(result.get("success", True))
                 if not ok and result.get("error_class") == LOCK_REFUSAL_ERROR_CLASS:
                     # Refused the palace write lock: no drawer was filed, so this
@@ -920,7 +1005,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     writer_lease = contextlib.ExitStack()
     try:
         resolved_backend = resolve_backend_name(palace_path, explicit=backend)
-        if backend_requires_single_writer(resolved_backend):
+        hub_proxy = _discover_hub_job_proxy(palace_path)
+        if backend_requires_single_writer(resolved_backend) and hub_proxy is None:
             try:
                 writer_lease.enter_context(mine_palace_lock(palace_path))
             except MineAlreadyRunning as exc:
@@ -936,7 +1022,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         # the caller's explicit/implicit distinction in queued payloads:
         # DaemonRuntime historically injects a backend only when one was
         # explicitly selected.
-        runtime = DaemonRuntime(palace_path, backend=backend)
+        runtime = DaemonRuntime(palace_path, backend=backend, hub_proxy=hub_proxy)
     except BaseException:
         writer_lease.close()
         _restore_server_process_state(previous_env, prev_umask)
@@ -995,6 +1081,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         "pid": os.getpid(),
                         "palace_path": runtime.palace_path,
                         "backend": runtime.backend,
+                        "execution_mode": "hub_proxy" if runtime.hub_proxy else "direct_writer",
                         "active_job_id": runtime.active_job_id,
                         "counts": runtime.store.counts(),
                     },

@@ -267,6 +267,51 @@ def test_count_codex_event_msg_not_doubled_by_response_item(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_codex_event_turns_count_and_extract_without_response_item_context(tmp_path):
+    """Current Codex turns come from event_msg, never response-item scaffolding."""
+    transcript = tmp_path / "codex.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "# AGENTS.md instructions for fixture"}
+                    ],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": []}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "legacy input"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "current input"}],
+                    },
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "current answer"}],
+                    },
+                },
+            },
+        ],
+    )
+
+    assert _count_human_messages(str(transcript)) == 2
+    assert _extract_recent_messages(str(transcript)) == ["legacy input", "current input"]
+
+
 # --- _extract_recent_messages ---
 
 
@@ -2265,6 +2310,11 @@ def test_parse_harness_input_unknown():
     with pytest.raises(SystemExit) as exc_info:
         _parse_harness_input({"session_id": "test"}, "unknown-harness")
     assert exc_info.value.code == 1
+
+
+def test_parse_harness_input_normalizes_null_transcript_path():
+    result = _parse_harness_input({"session_id": "abc-123", "transcript_path": None}, "claude-code")
+    assert result["transcript_path"] == ""
 
 
 def test_parse_harness_input_valid():

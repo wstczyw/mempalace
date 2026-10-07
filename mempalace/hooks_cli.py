@@ -31,7 +31,7 @@ from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig, normalize_wing_name
 from mempalace.fsio import decode_source
-from mempalace.normalize import codex_response_message
+from mempalace.normalize import _extract_codex_event_turn, codex_response_message
 from mempalace.timeutil import utc_now_iso
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -41,7 +41,17 @@ from mempalace.write_routing import (
     choose_write_route,
 )
 
-SAVE_INTERVAL = 15
+# Human messages between re-mines of a session transcript. A live transcript
+# is appended to on every turn, so its mtime always differs and
+# ``_is_unchanged_since_last_mine`` never skips it: each save re-mines the
+# whole file. ``convo_miner._file_chunks_locked`` now re-embeds only the
+# chunks whose text actually changed, but it still reads every drawer the
+# source already has in order to decide that -- so the per-save cost still
+# grows with the session, and the total over one session stays
+# O(n^2/SAVE_INTERVAL), with read-back rather than embedding as the term.
+# At 15, before that incremental path existed, a 446-message session cost
+# ~2.8 CPU-hours locally and held the palace write lock ~73% of the time.
+SAVE_INTERVAL = 100
 STATE_DIR = paths.state_path("hook_state")
 PALACE_ROOT = paths.state_home()
 
@@ -221,13 +231,12 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in text:
                                 continue
                         count += 1
-                    # Codex CLI transcripts nest a user turn as an event_msg
-                    # whose payload has type user_message and a message field.
+                    # Also handle legacy and current Codex CLI transcript formats.
                     elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
+                        turn = _extract_codex_event_turn(entry)
+                        if turn is not None:
+                            role, msg_text = turn
+                            if role == "user" and "<command-message>" not in msg_text:
                                 codex_events += 1
                     # Newer Codex rollouts may only record the turn as a
                     # response_item message.
@@ -953,14 +962,17 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         if _is_harness_boilerplate(content):
                             continue
                         messages.append(content.strip()[:200])
-                    # Codex CLI format
+                    # Legacy and current Codex CLI formats.
                     elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            text = payload.get("message", "")
-                            if isinstance(text, str) and text.strip():
-                                if not _is_harness_boilerplate(text):
-                                    messages.append(text.strip()[:200])
+                        turn = _extract_codex_event_turn(entry)
+                        if turn is not None:
+                            role, text = turn
+                            if (
+                                role == "user"
+                                and text.strip()
+                                and not _is_harness_boilerplate(text)
+                            ):
+                                messages.append(text.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -1399,10 +1411,12 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    raw_transcript_path = data.get("transcript_path", "")
+    transcript_path = "" if raw_transcript_path is None else str(raw_transcript_path)
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),
-        "transcript_path": str(data.get("transcript_path", "")),
+        "transcript_path": transcript_path,
     }
 
 

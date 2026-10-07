@@ -205,6 +205,10 @@ _FRAGMENTS = (
     "protocol.py",
     "http.py",
     "runtime.py",
+    # Hermes-local: restores the Hub daemon-job routes that upstream dropped
+    # when mcp_server.py became a package. Must stay last — it rebinds
+    # _http_handle_get and _build_http_server. See _hermes_hub.py.
+    "_hermes_hub.py",
 )
 
 

@@ -401,6 +401,60 @@ def test_codex_jsonl_valid():
     assert "> Q" in result
 
 
+def test_codex_jsonl_reads_item_completed_messages_but_skips_response_items():
+    """Codex 0.154 completion events, not response-item context, are canonical."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "# AGENTS.md instructions for fixture"}
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "content": {}},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "repair the hook"}],
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "hook repaired"}],
+                    },
+                },
+            }
+        ),
+    ]
+
+    assert _try_codex_jsonl("\n".join(lines)) == "> repair the hook\nhook repaired\n"
+
+
 def test_codex_jsonl_no_session_meta():
     """Without session_meta, codex parser returns None."""
     lines = [

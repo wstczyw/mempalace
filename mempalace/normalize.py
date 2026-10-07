@@ -399,11 +399,73 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _extract_codex_event_turn(entry) -> Optional[tuple[str, str]]:
+    """Return a canonical Codex conversation turn from one rollout event.
+
+    Legacy rollouts store text directly on ``user_message`` / ``agent_message``
+    payloads. Current rollouts store it in ``item_completed`` turn items. Only
+    ``event_msg`` records are accepted here: ``response_item`` records can
+    duplicate conversation turns and carry synthetic context (the transcript
+    reader uses them only as a fallback). Legacy text is returned verbatim,
+    including an empty string, so hook counters keep their historical
+    exchange-counting behavior; transcript consumers discard blank turns.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "event_msg":
+        return None
+
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type")
+    if payload_type == "user_message":
+        role = "user"
+        text = payload.get("message", "")
+    elif payload_type == "agent_message":
+        role = "assistant"
+        text = payload.get("message", "")
+    elif payload_type == "item_completed":
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "UserMessage":
+            role = "user"
+        elif item_type == "AgentMessage":
+            role = "assistant"
+        else:
+            return None
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return None
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            block_text = block.get("text")
+            if isinstance(block_text, str):
+                parts.append(block_text)
+        text = "\n".join(parts)
+    else:
+        return None
+
+    if not isinstance(text, str):
+        return None
+    if payload_type == "item_completed" and not text.strip():
+        return None
+    return role, text
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Prefers event_msg entries (user_message / agent_message), which represent
-    the canonical conversation turns. Newer Codex CLI rollouts (0.166+) can
+    Prefers event_msg turns (``user_message`` / ``agent_message`` and the
+    ``item_completed`` turn items of current rollouts), which represent the
+    canonical conversation turns. Newer Codex CLI rollouts (0.166+) can
     carry the conversation only as response_item messages; those are used
     when no event_msg turn is present, with synthetic context skipped.
 
@@ -424,7 +486,6 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             continue
         if not isinstance(entry, dict):
             continue
-
         entry_type = entry.get("type", "")
         if entry_type == "session_meta":
             has_session_meta = True
@@ -452,21 +513,13 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
                     response_messages.append(turn)
             continue
 
-        if entry_type != "event_msg":
+        turn = _extract_codex_event_turn(entry)
+        if turn is None:
             continue
-
-        payload_type = payload.get("type", "")
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
-        text = msg.strip()
-        if not text:
-            continue
-
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+        role, message = turn
+        text = message.strip()
+        if text:
+            messages.append((role, text))
 
     if not messages and not is_subagent:
         messages = response_messages

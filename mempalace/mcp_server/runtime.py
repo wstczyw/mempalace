@@ -322,11 +322,16 @@ def _run_http_loop() -> None:
     finally:
         if owns_writer_lease:
             # _serve_http uses daemon request threads, so synchronize with the
-            # dispatch lock before closing storage and exposing the palace to
-            # another process. Response serialization happens after this lock
-            # and no longer touches the backend.
-            with _HTTP_REQUEST_LOCK:
-                _release_mcp_writer_lock()
+            # lifecycle lock before the dispatch lock. An explicit-vector
+            # request yields its dispatch lease while embedding but retains the
+            # lifecycle read lease until its backend work finishes; releasing
+            # process ownership during that interval would let another process
+            # mutate the palace before this request resumes.
+            # Response serialization happens after these locks and no longer
+            # touches the backend.
+            with _HTTP_EMBEDDING_LIFECYCLE_LOCK:
+                with _HTTP_REQUEST_LOCK:
+                    _release_mcp_writer_lock()
 
 
 def _install_shutdown_signal_handlers() -> None:

@@ -169,6 +169,49 @@ def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypa
     assert released.returncode == 0
 
 
+def test_daemon_uses_live_hub_as_the_only_writer(tmp_path, monkeypatch):
+    """A live writable Hub turns the daemon into a durable queue/proxy only."""
+    proxy = daemon.HubJobProxy(base_url="http://127.0.0.1:8765", token="private", pid=1234)
+    forwarded = []
+    monkeypatch.setattr(daemon, "_discover_hub_job_proxy", lambda palace_path: proxy)
+    monkeypatch.setattr(
+        daemon,
+        "_forward_job_to_hub",
+        lambda target, kind, payload: (
+            forwarded.append((target, kind, payload))
+            or {"success": True, "exit_code": 0, "receipt": "hub-owned"}
+        ),
+    )
+
+    def must_not_lock(*args, **kwargs):
+        raise AssertionError("proxy daemon must not acquire the palace writer lease")
+
+    monkeypatch.setattr(daemon, "mine_palace_lock", must_not_lock)
+    client, thread, palace, holders = _start_server(
+        tmp_path,
+        monkeypatch,
+        lambda kind, payload: (_ for _ in ()).throw(
+            AssertionError("proxy daemon must not execute writes locally")
+        ),
+    )
+    try:
+        assert client.health()["execution_mode"] == "hub_proxy"
+        job = client.submit("diary_write", {"entry": "exact"})
+        finished = client.wait(job["id"], timeout=5)
+        assert finished["state"] == "succeeded"
+        assert finished["result"]["receipt"] == "hub-owned"
+        mine = client.submit("mine", {"source": "source"})
+        mine_finished = client.wait(mine["id"], timeout=5)
+        assert mine_finished["state"] == "succeeded"
+        assert mine_finished["result"]["receipt"] == "hub-owned"
+        assert [item[0] for item in forwarded] == [proxy, proxy]
+        assert [item[1] for item in forwarded] == ["diary_write", "mine"]
+        assert forwarded[0][2]["entry"] == "exact"
+        assert forwarded[1][2]["source"] == "source"
+    finally:
+        _stop_server(client, thread, holders)
+
+
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
