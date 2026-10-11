@@ -71,12 +71,27 @@ def _http_handle_internal_daemon_job(handler) -> None:
         # A daemon autosave uses the same explicit-vector embedding path as the
         # public MCP tool.  Give only that embedded interval to concurrent
         # readers while retaining the backend lifecycle lease until the write
-        # has committed.  Mine and every other daemon job keep the pre-existing
-        # whole-job writer boundary.
+        # has committed.  Mine yields between steps (below); every other
+        # daemon job keeps the whole-job writer boundary.
         # The 3.11 HTTP dispatcher installs this hook around the same
         # request lock.  Keep the Hub route on that public boundary so the
         # embedding section can yield the writer lease safely.
         with _http_embedding_release_installed("write"), _HTTP_REQUEST_LOCK:
+            result = execute_job(kind, payload)
+    elif kind == "mine":
+        # Hook transcript mines arrive here back to back. Same yielding
+        # boundary as the public mempalace_mine tool, so reads are not
+        # starved for the whole job. A long transcript is one file, so also
+        # release the lease around each embedding call like diary_write; mines
+        # stay mutually exclusive through _HTTP_MINE_LOCK.
+        from mempalace.palace import mine_yield_hook
+
+        with (
+            _HTTP_MINE_LOCK,
+            _http_embedding_release_installed("write"),
+            _HTTP_REQUEST_LOCK,
+            mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+        ):
             result = execute_job(kind, payload)
     else:
         with _HTTP_REQUEST_LOCK:
