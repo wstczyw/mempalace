@@ -1259,3 +1259,22 @@ class TestAmbiguousRecordsNeverBridgeFiles:
 
         out = _analyze_hallways([dict(r) for r in self.RECORDS])
         assert (out["self_links"], out["duplicates"]) == (0, 0)
+
+
+def test_failed_save_keeps_the_original_records(tmp_path, monkeypatch):
+    # The hallways pass runs outside the palace lock: a save that dies midway must
+    # leave the stored records as they were (the SQLite store rolls the transaction back).
+    monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda config=None: str(tmp_path / "h.json"))
+    hallways_mod._save_hallways([{"id": "a"}])
+    before = hallways_mod._load_hallways()
+
+    class Boom:
+        def __iter__(self):
+            raise OSError("disk full")
+
+    import pytest
+
+    with pytest.raises(OSError):
+        hallways_mod._save_hallways(Boom())
+    assert before == [{"id": "a"}]
+    assert hallways_mod._load_hallways() == before

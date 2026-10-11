@@ -476,6 +476,38 @@ class TestPalaceReadsDoNotStarveTheHub:
         assert time.monotonic() - t0 < 1.0
         mine_thread.join(timeout=10)
 
+    def test_a_read_runs_while_a_mine_computes_hallways(self, http_server, monkeypatch):
+        """The post-mine hallways pass (read-only scan + JSON write) runs outside the lock."""
+        port, _ = http_server
+        from mempalace import convo_miner, hallways
+
+        computing = threading.Event()
+
+        def slow_hallways(*_a, **_k):
+            computing.set()
+            time.sleep(1.5)
+            return []
+
+        monkeypatch.setattr(hallways, "compute_hallways_for_wing", slow_hallways)
+        monkeypatch.setitem(
+            mcp.TOOLS["mempalace_mine"],
+            "handler",
+            lambda **_k: convo_miner._compute_hallways_for_wing_safe("w", object(), 1)
+            or {"success": True},
+        )
+        monkeypatch.setitem(
+            mcp.TOOLS["mempalace_search"], "handler", lambda **_k: {"query": "x", "results": []}
+        )
+        mine_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "m"}, req_id=71)
+        )
+        mine_thread.start()
+        assert computing.wait(timeout=2)
+        t0 = time.monotonic()
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=72)
+        assert time.monotonic() - t0 < 1.0
+        mine_thread.join(timeout=10)
+
     def test_a_yielding_mine_restarts_the_write_stall_clock(self, http_server, monkeypatch):
         port, _ = http_server
         from mempalace.palace import mine_yield_point

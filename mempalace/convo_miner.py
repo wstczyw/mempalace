@@ -19,6 +19,7 @@ from typing import Optional
 
 from ._source_state import source_fingerprint
 from .backends import PalaceNotFoundError
+from .embedding import embedding_section
 from .entities import entities_metadata
 from .fsio import encoding_metadata, open_source_file
 from .ids import (
@@ -880,7 +881,10 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
     try:
         from .hallways import compute_hallways_for_wing
 
-        compute_hallways_for_wing(wing, col=collection, config=config)
+        # Read-only DB scan + one atomic JSON write (tens of seconds on a big wing):
+        # hosts that serialize the mine release their lock here, like embedding.
+        with embedding_section():
+            compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
         print(f"  (hallways skipped: {exc})")
 
