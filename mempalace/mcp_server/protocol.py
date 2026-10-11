@@ -1294,6 +1294,14 @@ def _write_stall_watch(tool_name: str):
             _write_stall_inflight = None
 
 
+def _write_stall_touch() -> None:
+    """Restart the in-flight write's stall clock: a mine that yields is progressing."""
+    with _write_stall_lock:
+        if _write_stall_inflight is not None:
+            _write_stall_inflight["since"] = time.monotonic()
+            _write_stall_inflight["warned"] = False
+
+
 def _start_write_stall_watchdog() -> None:
     """Start a daemon thread that reports a vector write that stopped returning.
 

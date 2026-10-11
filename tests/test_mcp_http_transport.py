@@ -449,6 +449,49 @@ class TestPalaceReadsDoNotStarveTheHub:
         names = [name for name, _ in log]
         assert names.index("a:file1:end") < names.index("b:file0:start"), names
 
+    def test_a_read_runs_while_a_mine_is_embedding(self, http_server, monkeypatch):
+        """Slow encoding inside one file must not hold the write lock."""
+        port, _ = http_server
+        from mempalace.embedding import embedding_section
+
+        embedding = threading.Event()
+
+        def slow_embedding_mine(**_kwargs):
+            with embedding_section():
+                embedding.set()
+                time.sleep(1.5)  # fake onnxruntime inference
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", slow_embedding_mine)
+        monkeypatch.setitem(
+            mcp.TOOLS["mempalace_search"], "handler", lambda **_k: {"query": "x", "results": []}
+        )
+        mine_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_mine", {"source": "m"}, req_id=61)
+        )
+        mine_thread.start()
+        assert embedding.wait(timeout=2)
+        t0 = time.monotonic()
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=62)
+        assert time.monotonic() - t0 < 1.0
+        mine_thread.join(timeout=10)
+
+    def test_a_yielding_mine_restarts_the_write_stall_clock(self, http_server, monkeypatch):
+        port, _ = http_server
+        from mempalace.palace import mine_yield_point
+
+        seen: dict = {}
+
+        def mine(**_kwargs):
+            mcp._write_stall_inflight["since"] -= 1000.0
+            mine_yield_point()
+            seen["age"] = time.monotonic() - mcp._write_stall_inflight["since"]
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", mine)
+        self._call(port, "mempalace_mine", {"source": "m"}, req_id=71)
+        assert seen["age"] < 5.0
+
 
 class TestEmbeddingDoesNotHoldTheHttpLock:
     """Embedding inference must not extend how long unrelated requests wait."""

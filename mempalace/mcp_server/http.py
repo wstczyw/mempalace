@@ -630,11 +630,21 @@ def _http_release_request_lock_for_embedding(mode: str):
 
 
 @contextlib.contextmanager
-def _http_embedding_release_installed(mode: str):
-    """Install this thread's embedding-section hook for one dispatch."""
+def _http_embedding_release_installed(mode: str, on_release=None):
+    """Install this thread's embedding-section hook for one dispatch.
+
+    ``on_release`` runs after each embedding section returns the lock.
+    """
     from ..embedding import set_embedding_section_hook
 
-    set_embedding_section_hook(lambda: _http_release_request_lock_for_embedding(mode))
+    @contextlib.contextmanager
+    def _section():
+        with _http_release_request_lock_for_embedding(mode):
+            yield
+        if on_release:
+            on_release()
+
+    set_embedding_section_hook(_section)
     try:
         yield
     finally:
@@ -699,10 +709,18 @@ def _http_dispatch(request):
         # exclusively, but hands the lock to waiting requests between files.
         from ..palace import mine_yield_hook
 
+        # Embedding also runs outside the lock (as in the Hub's mine branch), and
+        # every yield or embedding hand-off restarts the write-stall clock: a mine
+        # that keeps releasing the lock is progressing, not wedged.
+        def _yield():
+            _HTTP_REQUEST_LOCK.yield_write()
+            _write_stall_touch()
+
         locks = (
             _HTTP_MINE_LOCK,
+            _http_embedding_release_installed("write", on_release=_write_stall_touch),
             _HTTP_REQUEST_LOCK,
-            mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+            mine_yield_hook(_yield),
         )
         with _http_call_timing(tool_name, "write", locks):
             return handle_request(request)
