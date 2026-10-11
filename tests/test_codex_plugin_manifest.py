@@ -40,7 +40,8 @@ def test_mcp_config_registers_mempalace_server():
     assert config == {
         "mcpServers": {
             "mempalace": {
-                "command": "mempalace-mcp",
+                "type": "http",
+                "url": "http://127.0.0.1:8765/mcp",
             }
         }
     }

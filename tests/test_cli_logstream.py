@@ -266,6 +266,7 @@ class TestTaskCli:
             return subprocess.CompletedProcess(command, 0)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("shutil.which", lambda name: name)
         cmd_task(
             SimpleNamespace(
                 palace=palace_path,
@@ -481,6 +482,7 @@ class TestTaskCli:
             return subprocess.CompletedProcess(command, 0)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("shutil.which", lambda name: name)
         cmd_task(
             SimpleNamespace(
                 palace=str(tmp_path / "no-local-palace"),

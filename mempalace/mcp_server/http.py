@@ -713,8 +713,9 @@ def _http_dispatch(request):
         # every yield or embedding hand-off restarts the write-stall clock: a mine
         # that keeps releasing the lock is progressing, not wedged.
         def _yield():
-            _HTTP_REQUEST_LOCK.yield_write()
+            ran = _HTTP_REQUEST_LOCK.yield_write()
             _write_stall_touch()
+            return ran  # the miner reopens its collections when requests ran
 
         locks = (
             _HTTP_MINE_LOCK,

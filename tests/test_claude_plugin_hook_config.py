@@ -28,6 +28,7 @@ EVENT_TIMEOUT_BOUNDS: dict[str, tuple[int, int]] = {
     "Stop": (10, 30),
     "SessionEnd": (5, 30),
     "PreCompact": (60, 90),
+    "UserPromptSubmit": (3, 10),
 }
 
 
