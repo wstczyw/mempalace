@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -52,6 +53,15 @@ from mempalace.write_routing import (
 # At 15, before that incremental path existed, a 446-message session cost
 # ~2.8 CPU-hours locally and held the palace write lock ~73% of the time.
 SAVE_INTERVAL = 100
+# Stop used to block on diary_write for the full daemon wait (30s). A queued
+# palace write made that the Stop latency (P95 about 31s). Stop now waits a
+# short budget and, if the daemon does not confirm, fsyncs the whole entry to
+# pending_diary.jsonl before returning. SessionEnd and PreCompact keep 30s.
+_DIARY_WAIT_SECS = 30
+_STOP_DIARY_WAIT_DEFAULT_SECS = 2.0
+_STOP_DIARY_WAIT_ENV = "MEMPALACE_HOOK_DIARY_WAIT_SECS"
+_PENDING_DIARY_NAME = "pending_diary.jsonl"
+_PENDING_DIARY_GUARD = threading.Lock()
 STATE_DIR = paths.state_path("hook_state")
 PALACE_ROOT = paths.state_home()
 
@@ -1194,6 +1204,354 @@ def _apply_diary_checkpoint(payload: dict) -> bool:
     return True
 
 
+def _stop_diary_wait_secs() -> float:
+    """Short Stop budget. Unset, blank, or non-positive values stay at 2s."""
+
+    raw = os.environ.get(_STOP_DIARY_WAIT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return _STOP_DIARY_WAIT_DEFAULT_SECS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _STOP_DIARY_WAIT_DEFAULT_SECS
+    if not (value > 0) or value == float("inf"):
+        return _STOP_DIARY_WAIT_DEFAULT_SECS
+    return value
+
+
+def _pending_diary_path() -> Path:
+    return STATE_DIR / _PENDING_DIARY_NAME
+
+
+def _diary_idempotency_key(session_id: str, entry: str) -> str:
+    """session_id plus the sha256 of the diary entry. Same text, same key."""
+
+    digest = hashlib.sha256(entry.encode("utf-8")).hexdigest()
+    return f"{session_id}:{digest}"
+
+
+def _pending_diary_record(session_id: str, payload: dict) -> dict:
+    entry = str(payload.get("entry") or "")
+    return {
+        "session_id": session_id,
+        "idempotency_key": _diary_idempotency_key(session_id, entry),
+        "payload": {
+            "agent_name": payload.get("agent_name", ""),
+            "entry": entry,
+            "topic": payload.get("topic", "checkpoint"),
+            "wing": payload.get("wing", ""),
+        },
+    }
+
+
+def _payload_from_pending(record: dict) -> dict | None:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        payload = record
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or entry == "":
+        return None
+    return {
+        "agent_name": payload.get("agent_name", ""),
+        "entry": entry,
+        "topic": payload.get("topic") or "checkpoint",
+        "wing": payload.get("wing") or "",
+    }
+
+
+def _pending_diary_line(record: dict) -> str:
+    raw = record.get("_raw")
+    if isinstance(raw, str) and set(record) == {"_raw"}:
+        return raw + "\n"
+    return json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def _read_pending_diary() -> tuple[list[dict], bool]:
+    """Return (records, readable). Unreadable must not be rewritten."""
+
+    path = _pending_diary_path()
+    if not path.exists():
+        return [], True
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return [], False
+    records: list[dict] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            records.append({"_raw": stripped})
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+        else:
+            records.append({"_raw": stripped})
+    return records, True
+
+
+def _write_pending_diary(records: list[dict]) -> None:
+    """Atomically replace the queue and fsync before the caller returns."""
+
+    path = _pending_diary_path()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    body = "".join(_pending_diary_line(record) for record in records).encode("utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "wb") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _append_pending_diary(record: dict) -> None:
+    """Durably queue one diary payload. An existing idempotency key is kept once."""
+
+    key = record.get("idempotency_key")
+    path = _pending_diary_path()
+    try:
+        with _PENDING_DIARY_GUARD:
+            current, readable = _read_pending_diary()
+            if not readable:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(_pending_diary_line(record))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                return
+            if isinstance(key, str) and any(item.get("idempotency_key") == key for item in current):
+                return
+            current.append(record)
+            _write_pending_diary(current)
+    except Exception as exc:
+        _log(f"Pending diary persist failed: {exc}")
+
+
+def _drop_confirmed_pending(confirmed: set[str]) -> None:
+    """Remove landed keys and collapse duplicate keys. Leave the file if unsure."""
+
+    path = _pending_diary_path()
+    if not path.is_file():
+        return
+    try:
+        with _PENDING_DIARY_GUARD:
+            current, readable = _read_pending_diary()
+            if not readable:
+                _log("Pending diary rewrite skipped: queue could not be read")
+                return
+            kept: list[dict] = []
+            seen: set[str] = set()
+            changed = False
+            for record in current:
+                key = record.get("idempotency_key")
+                if isinstance(key, str) and key in confirmed:
+                    changed = True
+                    continue
+                if isinstance(key, str):
+                    if key in seen:
+                        changed = True
+                        continue
+                    seen.add(key)
+                kept.append(record)
+            if not changed:
+                return
+            _write_pending_diary(kept)
+    except Exception as exc:
+        _log(f"Pending diary rewrite failed: {exc}")
+
+
+def _diary_job_written(job: dict) -> bool:
+    """True only when the daemon finished the diary write.
+
+    A lock deferral is not a write: the job is queued, so it must not be acked.
+    It is also not a failure, so the caller must not file a second copy.
+    """
+
+    result = job.get("result") or {}
+    if not isinstance(result, dict):
+        return False
+    return job.get("state") == "succeeded" and bool(result.get("success"))
+
+
+def _flush_pending_diary(budget_secs: float) -> set[str]:
+    """Replay queued diary writes inside one short budget.
+
+    Written keys are removed and returned. A key the daemon parked behind the
+    palace lock is removed too (the queue owns it) but not returned, so the
+    caller does not ack it. Failures and lines that do not fit stay. Each
+    idempotency key is submitted at most once per flush.
+    """
+
+    confirmed: set[str] = set()
+    parked: set[str] = set()
+    try:
+        budget = float(budget_secs)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if not (budget > 0) or budget == float("inf"):
+        budget = 0.0
+    deadline = time.monotonic() + budget
+    with _PENDING_DIARY_GUARD:
+        records, readable = _read_pending_diary()
+    if not readable or not records:
+        return confirmed
+
+    seen: set[str] = set()
+    for record in records:
+        key = record.get("idempotency_key")
+        if not isinstance(key, str) or key == "":
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        payload = _payload_from_pending(record)
+        if payload is None:
+            continue
+        try:
+            job = _submit_daemon_job(
+                "diary_write",
+                payload,
+                dedupe_key=key,
+                priority=10,
+                wait=True,
+                timeout=remaining,
+            )
+        except Exception as exc:
+            _log(f"Pending diary flush failed: {exc}")
+            continue
+        if _job_deferred_by_lock(job):
+            parked.add(key)
+            continue
+        if _diary_job_written(job):
+            confirmed.add(key)
+            continue
+        result = job.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+        _log(f"Pending diary flush failed: {result.get('error', job.get('error'))}")
+    _drop_confirmed_pending(confirmed | parked)
+    return confirmed
+
+
+def _ack_diary_checkpoint(
+    messages: list,
+    themes: list,
+    toast: bool,
+    now: datetime,
+    entry_id: str,
+    punctuation: str,
+) -> dict:
+    _log(f"Diary checkpoint saved: {entry_id}")
+    try:
+        ack_file = STATE_DIR / "last_checkpoint"
+        ack_file.write_text(
+            json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    if toast:
+        try:
+            _desktop_toast(f"Checkpoint saved {punctuation} {len(messages)} messages archived")
+        except Exception as exc:
+            _log(f"Diary checkpoint toast failed: {exc}")
+    return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
+
+
+def _file_diary_via_daemon(
+    *,
+    hook_event: str,
+    payload: dict,
+    pending_record: dict,
+    messages: list,
+    themes: list,
+    toast: bool,
+    now: datetime,
+) -> dict:
+    """File one checkpoint through the daemon, or leave it queued on disk.
+
+    Only Stop uses the short wait. Every other caller, including SessionEnd and
+    PreCompact, keeps the original 30s wait. Replaying the queue is always
+    capped by the short budget so a backed-up daemon cannot add another 30s.
+    """
+
+    idem_key = str(pending_record.get("idempotency_key") or "")
+    if hook_event == "stop":
+        budget = _stop_diary_wait_secs()
+        started = time.monotonic()
+        confirmed = _flush_pending_diary(budget)
+        current_timeout = max(0.0, budget - (time.monotonic() - started))
+    else:
+        confirmed = _flush_pending_diary(_stop_diary_wait_secs())
+        current_timeout = _DIARY_WAIT_SECS
+
+    if idem_key in confirmed:
+        return _ack_diary_checkpoint(messages, themes, toast, now, "flushed", "-")
+
+    failed = {"drawers_filed": 0, "messages_folded": 0}
+    if hook_event == "stop" and current_timeout <= 0.0:
+        # The budget was spent replaying older lines. Keep this entry on disk
+        # instead of opening another daemon wait.
+        _append_pending_diary(pending_record)
+        _log("Daemon diary checkpoint deferred to pending: stop wait budget exhausted")
+        return failed
+
+    from .daemon import DaemonWaitTimeout
+
+    try:
+        job = _submit_daemon_job(
+            "diary_write",
+            payload,
+            dedupe_key=idem_key,
+            priority=10,
+            wait=True,
+            timeout=current_timeout,
+        )
+    except DaemonWaitTimeout as exc:
+        # Queued or running behind an earlier job (often a Stop-hook mine): the
+        # daemon files it once that job ends, so it is not a failure (#2757).
+        # The line still goes on disk; a replay reuses the same dedupe key and
+        # gets the queued job back instead of a second copy.
+        _append_pending_diary(pending_record)
+        _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
+        return failed
+    except Exception as exc:
+        # The daemon may already have the job. Never fall back to a direct
+        # write. The payload is on disk before we return so a later flush can
+        # confirm the same idempotency key.
+        _append_pending_diary(pending_record)
+        _log(f"Daemon diary checkpoint failed: {exc}")
+        return failed
+
+    result = job.get("result") or {}
+    if not isinstance(result, dict):
+        result = {}
+    if job.get("state") == "succeeded" and result.get("success"):
+        _drop_confirmed_pending({idem_key})
+        return _ack_diary_checkpoint(
+            messages,
+            themes,
+            toast,
+            now,
+            str(result.get("entry_id", "?")),
+            "-",
+        )
+    if _job_deferred_by_lock(job):
+        # Queued behind the palace lock: the daemon files it when the holder
+        # exits. Not a failure, and not a second copy in the pending file.
+        _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
+        _drop_confirmed_pending({idem_key})
+        return failed
+    _append_pending_diary(pending_record)
+    _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
+    return failed
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,
@@ -1202,6 +1560,7 @@ def _save_diary_direct(
     *,
     agent_name: str,
     exchange_count: Optional[int] = None,
+    hook_event: str = "",
 ) -> dict:
     """Queue a diary checkpoint without importing ``mempalace.mcp_server``.
 
@@ -1253,57 +1612,25 @@ def _save_diary_direct(
         f"CHECKPOINT:{now.strftime('%Y-%m-%d')}|session:{session_id}"
         f"|msgs:{len(messages)}|recent:{topics}"
     )
+    payload = {
+        "agent_name": agent_name,
+        "entry": entry,
+        "topic": "checkpoint",
+        "wing": wing,
+    }
+    pending_record = _pending_diary_record(session_id, payload)
 
     try:
         if routing.use_daemon:
-            from .daemon import DaemonWaitTimeout
-
-            try:
-                job = _submit_daemon_job(
-                    "diary_write",
-                    {
-                        "agent_name": agent_name,
-                        "entry": entry,
-                        "topic": "checkpoint",
-                        "wing": wing,
-                    },
-                    priority=10,
-                    wait=True,
-                    timeout=30,
-                )
-            except DaemonWaitTimeout as exc:
-                # The daemon runs one job at a time, so a checkpoint submitted
-                # while a mine from an earlier Stop hook still runs waits behind
-                # it. It is filed once that mine ends: not a failure, and not a
-                # reason to write it here as well.
-                _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
-                return {"drawers_filed": 0, "messages_folded": 0}
-            except Exception as exc:
-                # Daemon accepted context — don't fall back (would double-write).
-                _log(f"Daemon diary checkpoint failed: {exc}")
-                return {"drawers_filed": 0, "messages_folded": 0}
-            result = job.get("result") or {}
-            if job.get("state") == "succeeded" and result.get("success"):
-                _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
-                try:
-                    ack_file = STATE_DIR / "last_checkpoint"
-                    ack_file.write_text(
-                        json.dumps({"msgs": len(messages), "ts": utc_now_iso()}),
-                        encoding="utf-8",
-                    )
-                except OSError:
-                    pass
-                if toast:
-                    _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
-                return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
-            if _job_deferred_by_lock(job):
-                # Queued behind the palace lock: the entry is held and the daemon
-                # files it once the holder exits. Not a failure, and not a reason
-                # to re-file it here -- that would duplicate verbatim content.
-                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
-                return {"drawers_filed": 0, "messages_folded": 0}
-            _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
-            return {"drawers_filed": 0, "messages_folded": 0}
+            return _file_diary_via_daemon(
+                hook_event=hook_event,
+                payload=payload,
+                pending_record=pending_record,
+                messages=messages,
+                themes=themes,
+                toast=toast,
+                now=now,
+            )
 
         queued = _queue_diary_checkpoint(
             {
@@ -1685,6 +2012,7 @@ def hook_stop(data: dict, harness: str):
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
                         exchange_count=exchange_count,
+                        hook_event="stop",
                     )
                 queued = result.get("checkpoint_queued", False)
                 if not queued:
@@ -1863,6 +2191,7 @@ def hook_session_end(data: dict, harness: str):
                     wing=_project_wing(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
+                    hook_event="session-end",
                 )
             if not result.get("checkpoint_queued"):
                 if valid_transcript:

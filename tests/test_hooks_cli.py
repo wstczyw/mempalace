@@ -608,6 +608,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
         toast=False,
         agent_name="claude",
         exchange_count=SAVE_INTERVAL,
+        hook_event="stop",
     )
 
 
@@ -634,6 +635,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
         toast=False,
         agent_name="claude",
         exchange_count=SAVE_INTERVAL,
+        hook_event="stop",
     )
 
 
@@ -2765,7 +2767,12 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="sessions", toast=False, agent_name="claude"
+        expected_path,
+        "sess",
+        wing="sessions",
+        toast=False,
+        agent_name="claude",
+        hook_event="session-end",
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
