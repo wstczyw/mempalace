@@ -152,10 +152,6 @@ def _paged_metadata(collection):
     total = collection.count()
     offset = 0
     while offset < total:
-        # Non-chroma backends land here; a mine's pre-scan pages the whole
-        # palace under the Hub's write lock. Pages hold no cursor between
-        # calls, so queued readers may run between them.
-        mine_yield_point()
         batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
         yield from batch["metadatas"]
         if not batch["ids"]:
