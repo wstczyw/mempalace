@@ -479,8 +479,15 @@ def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, pr
             *_ORT_MIN_EXTERNAL_DATA_FOLDER,
         )
         patch = None
-    if patch is not None:
+
+    def session_options():
         so = _intra_op_session_options(intra_op_num_threads) or ort.SessionOptions()
+        # same as #2893: the CPU arena keeps the largest batch's high-water mark for the life of the server
+        so.enable_cpu_mem_arena = False
+        return so
+
+    if patch is not None:
+        so = session_options()
         if patch.external_data_dir is not None:
             so.add_session_config_entry(
                 "session.model_external_initializers_file_folder_path", patch.external_data_dir
@@ -493,11 +500,7 @@ def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, pr
                 "unchanged, which dequantizes the full token table on every run",
                 exc_info=True,
             )
-    return ort.InferenceSession(
-        model_path,
-        sess_options=_intra_op_session_options(intra_op_num_threads),
-        providers=providers,
-    )
+    return ort.InferenceSession(model_path, sess_options=session_options(), providers=providers)
 
 
 def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):

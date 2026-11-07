@@ -361,6 +361,33 @@ def test_new_onnxruntime_points_the_patch_at_its_external_data(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("threads", [0, 3])
+@pytest.mark.parametrize("path_taken", ["patched", "fallback_no_patch", "fallback_rejected"])
+def test_embeddinggemma_sessions_turn_the_cpu_arena_off(tmp_path, path_taken, threads):
+    """Same as upstream #2893 for the default embedder: the CPU arena keeps the
+    largest batch's high-water mark for the life of the server, with or without
+    an intra-op cap, on the patched path and on both fallbacks."""
+    path = tmp_path / "m.onnx"
+    _model(path)
+    patch = None if path_taken == "fallback_no_patch" else gather_before_dequantize(str(path))
+    seen = []
+
+    def session(model, sess_options=None, providers=None):
+        seen.append(sess_options)
+        if path_taken == "fallback_rejected" and isinstance(model, bytes):
+            raise RuntimeError("injected rejection")
+        return object()
+
+    fake = SimpleNamespace(
+        __version__="1.21.0", SessionOptions=ort.SessionOptions, InferenceSession=session
+    )
+    embedding._new_embeddinggemma_session(fake, str(path), patch, threads, ["CPUExecutionProvider"])
+    assert len(seen) == (2 if path_taken == "fallback_rejected" else 1)
+    for so in seen:
+        assert so.enable_cpu_mem_arena is False
+        assert so.intra_op_num_threads == threads
+
+
 def test_external_data_session_reads_the_model_weights_not_the_working_directory(
     tmp_path, monkeypatch, caplog
 ):
