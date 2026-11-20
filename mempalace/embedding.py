@@ -482,7 +482,7 @@ def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, pr
 
     def session_options():
         so = _intra_op_session_options(intra_op_num_threads) or ort.SessionOptions()
-        # same as #2893: the CPU arena keeps the largest batch's high-water mark for the life of the server
+        # the CPU arena keeps the largest batch's high-water mark for the life of the server
         so.enable_cpu_mem_arena = False
         return so
 

@@ -19,6 +19,7 @@ HUB = os.environ.get("MEMPALACE_RECALL_URL", "http://127.0.0.1:8765/mcp")
 BUDGET_SECONDS = float(os.environ.get("MEMPALACE_RECALL_TIMEOUT", "4"))
 LIMIT = 3
 SNIPPET_CHARS = 240
+QUERY_CHARS = 250  # mempalace_search rejects longer queries ("must be at most 250 characters")
 # Questions about the past: where recall changes the first action.
 TRIGGER = re.compile(
     r"上次|之前|以前|当时|先例|历史|记得|为什么|为啥|根因|怎么做的|原来|裁定|决定过|老办法|又出现|又坏"
@@ -48,7 +49,10 @@ def _search(query: str) -> list:
         raw = resp.read().decode("utf-8")
     if raw.lstrip().startswith("event:") or "\ndata:" in raw:
         raw = next(line[5:] for line in raw.splitlines() if line.startswith("data:"))
-    payload = json.loads(json.loads(raw)["result"]["content"][0]["text"])
+    reply = json.loads(raw)
+    if "error" in reply:
+        raise RuntimeError(str(reply["error"].get("message") or reply["error"])[:200])
+    payload = json.loads(reply["result"]["content"][0]["text"])
     return payload.get("results") or []
 
 
@@ -81,9 +85,9 @@ def main() -> int:
         return 0
     started = time.monotonic()
     try:
-        hits = _search(prompt[:400])
+        hits = _search(prompt[:QUERY_CHARS])
     except Exception as exc:
-        _log(f"skip:{type(exc).__name__}", started)
+        _log(f"skip:{type(exc).__name__}:{str(exc)[:200]}", started)
         return 0
     lines = [_line(h) for h in hits if isinstance(h, dict)]
     lines = [line for line in lines if len(line) > 8]

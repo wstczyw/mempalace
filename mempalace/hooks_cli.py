@@ -281,7 +281,11 @@ def _log(message: str):
             _state_dir_initialized = True
         log_path = STATE_DIR / "hook.log"
         is_new = not log_path.exists()
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        # shortcut: one rotated copy (hook.log.1) at 5 MB, no size-based retention; upgrade to RotatingFileHandler if more history is needed
+        if not is_new and log_path.stat().st_size > 5_000_000:
+            log_path.replace(log_path.with_name("hook.log.1"))
+            is_new = True
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(log_path, "a") as f:
             f.write(f"[{timestamp}] {message}\n")
         if is_new:
@@ -1515,7 +1519,7 @@ def _file_diary_via_daemon(
         )
     except DaemonWaitTimeout as exc:
         # Queued or running behind an earlier job (often a Stop-hook mine): the
-        # daemon files it once that job ends, so it is not a failure (#2757).
+        # daemon files it once that job ends, so it is not a failure.
         # The line still goes on disk; a replay reuses the same dedupe key and
         # gets the queued job back instead of a second copy.
         _append_pending_diary(pending_record)

@@ -3203,3 +3203,14 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+def test_hook_log_lines_carry_date_and_rotate_past_5mb():
+    import re
+
+    log = hooks_cli_mod.STATE_DIR / "hook.log"
+    log.write_text("x" * 5_000_001, encoding="utf-8")
+    hooks_cli_mod._log("hello")
+    assert (hooks_cli_mod.STATE_DIR / "hook.log.1").stat().st_size == 5_000_001
+    [line] = log.read_text(encoding="utf-8").splitlines()
+    assert re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello", line)
