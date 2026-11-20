@@ -492,8 +492,9 @@ class TestPalaceReadsDoNotStarveTheHub:
         monkeypatch.setitem(
             mcp.TOOLS["mempalace_mine"],
             "handler",
-            lambda **_k: convo_miner._compute_hallways_for_wing_safe("w", object(), 1)
-            or {"success": True},
+            lambda **_k: (
+                convo_miner._compute_hallways_for_wing_safe("w", object(), 1) or {"success": True}
+            ),
         )
         monkeypatch.setitem(
             mcp.TOOLS["mempalace_search"], "handler", lambda **_k: {"query": "x", "results": []}

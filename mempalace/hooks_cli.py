@@ -1552,6 +1552,7 @@ def _file_diary_via_daemon(
     _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
     return failed
 
+
 def _save_diary_direct(
     transcript_path: str,
     session_id: str,

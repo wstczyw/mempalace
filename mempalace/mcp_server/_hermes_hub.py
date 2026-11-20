@@ -133,8 +133,8 @@ def _build_http_server(host: str, port: int):
     from mempalace.server_registry import load_server_tokens
 
     internal_tokens = load_server_tokens(_config.palace_path)
-    httpd.internal_token = internal_tokens[0] if internal_tokens else getattr(
-        httpd, "auth_token", ""
+    httpd.internal_token = (
+        internal_tokens[0] if internal_tokens else getattr(httpd, "auth_token", "")
     )
 
     handler_cls = httpd.RequestHandlerClass

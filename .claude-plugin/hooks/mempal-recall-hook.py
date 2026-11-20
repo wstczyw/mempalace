@@ -39,7 +39,10 @@ def _search(query: str) -> list:
     req = urllib.request.Request(
         HUB,
         data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
     )
     with urllib.request.urlopen(req, timeout=BUDGET_SECONDS) as resp:
         raw = resp.read().decode("utf-8")
@@ -62,7 +65,9 @@ def _log(outcome: str, started: float) -> None:
     try:
         path = os.path.join(os.path.expanduser("~"), ".mempalace", "hook_state", "recall.log")
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {outcome} {time.monotonic() - started:.1f}s\n")
+            fh.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} {outcome} {time.monotonic() - started:.1f}s\n"
+            )
     except OSError:
         pass
 
@@ -92,7 +97,12 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     print(
         json.dumps(
-            {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            },
             ensure_ascii=False,
         )
     )
