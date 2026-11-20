@@ -2297,3 +2297,32 @@ def test_sqlite_exact_recency_indexes_are_additive_and_skipped_read_only(tmp_pat
             assert col.get_recent(limit=25, where=aliases).ids == expected["wing"]
         finally:
             backend.close_palace(palace)
+
+
+def test_vector_cache_rebuilt_after_peer_commit_before_next_query(tmp_path, monkeypatch):
+    backend, col = _collection(tmp_path)
+    col.add(ids=["a"], documents=["alpha"], metadatas=[{"wing": "w"}], embeddings=[[1.0, 0.0]])
+    loads = []
+    real_load = sqlite_exact_module.SQLiteExactCollection._load_all_vectors
+
+    def counting_load(self, *args):
+        loads.append(1)
+        return real_load(self, *args)
+
+    monkeypatch.setattr(
+        sqlite_exact_module.SQLiteExactCollection, "_load_all_vectors", counting_load
+    )
+    col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert len(loads) == 1
+
+    # A second backend stands in for the daemon: its commit bumps data_version
+    # on the first backend's connection, so the cached matrix is stale.
+    peer, peer_col = _collection(tmp_path, create=False)
+    peer_col.add(ids=["b"], documents=["beta"], metadatas=[{"wing": "w"}], embeddings=[[0.0, 1.0]])
+    backend._refresh_vector_caches()
+    assert len(loads) == 2
+
+    assert col.query(query_embeddings=[[0.0, 1.0]], n_results=1).ids[0] == ["b"]
+    assert len(loads) == 2
+    peer.close()
+    backend.close()

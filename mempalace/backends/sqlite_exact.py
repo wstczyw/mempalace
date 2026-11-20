@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -499,6 +500,8 @@ class _SQLiteExactHandle:
         # ``_vector_cache_data_version`` detects commits from other handles.
         self._vector_cache: dict[int, tuple[list[str], np.ndarray, np.ndarray, list[dict]]] = {}
         self._vector_cache_data_version: Optional[int] = None
+        # collection_id -> name, so the background warmer can rebuild each entry.
+        self._vector_cache_names: dict[int, str] = {}
         # Native accelerators share one versioned index per collection across
         # the short-lived wrappers created by application searches.
         self._native_cache: dict[str, tuple[tuple, Any]] = {}
@@ -1182,6 +1185,9 @@ class SQLiteExactCollection(BaseCollection):
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
             self._handle._vector_cache[collection_id] = cached
+            self._handle._vector_cache_names[collection_id] = self._collection_name
+            if self._backend is not None:
+                self._backend._start_vector_warmer()
         ids, mat, norms, metas = cached
         if not where and not where_document:
             return ids, mat, norms
@@ -1800,6 +1806,45 @@ class SQLiteExactBackend(BaseBackend):
         self._palace_lifetimes: dict[str, object] = {}
         self._clients_lock = threading.RLock()
         self._closed = False
+        self._warmer_started = False
+
+    def _start_vector_warmer(self) -> None:
+        with self._clients_lock:
+            if self._warmer_started or self._closed:
+                return
+            self._warmer_started = True
+        threading.Thread(
+            target=self._warm_vector_caches_loop, daemon=True, name="sqlite-exact-warm"
+        ).start()
+
+    def _warm_vector_caches_loop(self) -> None:
+        # shortcut: polls PRAGMA data_version every 2 s and reloads the cached vector matrix right after another connection commits, so a search does not pay the full reload; a reload that starts with cold file cache still takes 20-30 s, upgrade to incremental refresh if that shows up.
+        while not self._closed:
+            time.sleep(2)
+            try:
+                self._refresh_vector_caches()
+            except Exception:
+                logger.debug("sqlite_exact vector warmer pass failed", exc_info=True)
+
+    def _refresh_vector_caches(self) -> None:
+        with self._clients_lock:
+            handles = list(self._clients.values()) + list(self._read_only_clients.values())
+        for handle in handles:
+            with handle.lock:
+                if handle.closed or not handle._vector_cache_names:
+                    continue
+                cur = handle.conn.cursor()
+                data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+                if data_version == handle._vector_cache_data_version:
+                    continue
+                handle._vector_cache.clear()
+                handle._vector_cache_data_version = data_version
+                for collection_id, name in list(handle._vector_cache_names.items()):
+                    coll = SQLiteExactCollection(handle, name, self)
+                    expected = coll._collection_dimension(cur, collection_id)
+                    handle._vector_cache[collection_id] = coll._load_all_vectors(
+                        cur, collection_id, expected
+                    )
 
     @staticmethod
     def _db_path(palace_path: str) -> str:
