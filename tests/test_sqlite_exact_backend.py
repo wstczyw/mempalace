@@ -2399,3 +2399,18 @@ def test_vector_cache_reloads_when_write_gives_no_ids(tmp_path, monkeypatch):
     col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
     assert loads == [None]
     backend.close()
+
+
+def test_lexical_search_skips_stop_words_unless_nothing_else_is_left(tmp_path):
+    backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["the cat and the dog and the bird", "a zebra crossed"],
+        metadatas=[{"wing": "w"}, {"wing": "w"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    # The stop words are dropped from the FTS query, so only the rare term decides.
+    assert [h.id for h in col.lexical_search(query="the and zebra").hits] == ["b"]
+    # A query made only of stop words still searches, as before.
+    assert [h.id for h in col.lexical_search(query="the and").hits] == ["a"]
+    backend.close()

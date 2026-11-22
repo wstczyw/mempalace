@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from ..lexical import bm25_scores, tokenize
+from ..lexical import FTS_STOP_WORDS, bm25_scores, tokenize
 from ..stored_text import (
     decode_record,
     decode_value,
@@ -1762,6 +1762,7 @@ class SQLiteExactCollection(BaseCollection):
         if not self._fts_available(cur):
             return None
         tokens = [t for t in tokenize(query) if len(t) >= 2]
+        tokens = [t for t in tokens if t not in FTS_STOP_WORDS] or tokens
         if not tokens:
             return None
         fts_query = " OR ".join(tokens)

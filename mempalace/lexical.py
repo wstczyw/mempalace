@@ -8,6 +8,16 @@ import re
 
 TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
+# Left out of the FTS OR-query: each one matches nearly every drawer, so BM25
+# has to walk a posting list the size of the palace (0.3 s warm, 2-5 s when the
+# file cache is cold) for almost no ranking signal.
+FTS_STOP_WORDS = frozenset(
+    "the and this that these those with for are was were has have had not but you your "
+    "from they them their our its what when where which who whom why how did does can "
+    "will would could should may might been being into about than then there here also "
+    "just more most some any all one out over such only very".split()
+)
+
 
 def tokenize(text, stop_words: frozenset = frozenset()) -> list:
     """Lowercased word tokens of two or more characters.
