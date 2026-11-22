@@ -1381,8 +1381,10 @@ class SQLiteExactCollection(BaseCollection):
             for start in range(0, len(only_ids), 900):
                 chunk = only_ids[start : start + 900]
                 marks = ",".join("?" for _ in chunk)
+                # No ORDER BY rowid: with it SQLite scans the whole collection (1.5 s hot)
+                # via idx_documents_collection instead of seeking the primary key.
                 rows += cur.execute(
-                    select + f"AND id IN ({marks}) ORDER BY rowid", (collection_id, *chunk)
+                    select + f"AND id IN ({marks})", (collection_id, *chunk)
                 ).fetchall()
         ids: list[str] = []
         vecs: list[np.ndarray] = []
