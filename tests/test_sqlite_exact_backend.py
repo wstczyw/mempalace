@@ -2305,9 +2305,9 @@ def test_vector_cache_rebuilt_after_peer_commit_before_next_query(tmp_path, monk
     loads = []
     real_load = sqlite_exact_module.SQLiteExactCollection._load_all_vectors
 
-    def counting_load(self, *args):
+    def counting_load(self, *args, **kwargs):
         loads.append(1)
-        return real_load(self, *args)
+        return real_load(self, *args, **kwargs)
 
     monkeypatch.setattr(
         sqlite_exact_module.SQLiteExactCollection, "_load_all_vectors", counting_load
@@ -2325,4 +2325,77 @@ def test_vector_cache_rebuilt_after_peer_commit_before_next_query(tmp_path, monk
     assert col.query(query_embeddings=[[0.0, 1.0]], n_results=1).ids[0] == ["b"]
     assert len(loads) == 2
     peer.close()
+    backend.close()
+
+
+def test_own_writes_patch_vector_cache_without_full_reload(tmp_path, monkeypatch):
+    # One backend, a writer handle and a read-only handle, like the hub.
+    backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["alpha", "beta", "gamma"],
+        metadatas=[{"wing": "w"}, {"wing": "w"}, {"wing": "w"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]],
+    )
+    reader = backend.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        options={"read_only": True},
+    )
+    full, partial = [], []
+    real_load = sqlite_exact_module.SQLiteExactCollection._load_all_vectors
+
+    def counting_load(self, cur, collection_id, expected, only_ids=None):
+        (full if only_ids is None else partial).append(1)
+        return real_load(self, cur, collection_id, expected, only_ids=only_ids)
+
+    monkeypatch.setattr(
+        sqlite_exact_module.SQLiteExactCollection, "_load_all_vectors", counting_load
+    )
+
+    def ranking(c, **kwargs):
+        return c.query(query_embeddings=[[1.0, 0.0]], n_results=10, **kwargs).ids[0]
+
+    assert ranking(reader) == ["a", "c", "b"]
+    assert len(full) == 1
+
+    col.add(ids=["d"], documents=["delta"], metadatas=[{"wing": "x"}], embeddings=[[-1.0, 0.0]])
+    col.upsert(ids=["b"], documents=["beta2"], metadatas=[{"wing": "x"}], embeddings=[[1.0, 0.1]])
+    col.update(ids=["c"], metadatas=[{"wing": "x"}])
+    col.delete(ids=["a"])
+
+    assert ranking(reader) == ["b", "c", "d"]
+    assert ranking(reader, where={"wing": "x"}) == ["b", "c", "d"]
+    assert len(full) == 1 and partial  # patched, not re-read
+
+    fresh = SQLiteExactBackend()
+    fresh_col = fresh.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        options={"read_only": True},
+    )
+    assert ranking(fresh_col) == ranking(reader)
+    fresh.close()
+    backend.close()
+
+
+def test_vector_cache_reloads_when_write_gives_no_ids(tmp_path, monkeypatch):
+    backend, col = _collection(tmp_path)
+    col.add(ids=["a"], documents=["alpha"], metadatas=[{"wing": "w"}], embeddings=[[1.0, 0.0]])
+    col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    loads = []
+    real_load = sqlite_exact_module.SQLiteExactCollection._load_all_vectors
+
+    def counting_load(self, *args, **kwargs):
+        loads.append(kwargs.get("only_ids"))
+        return real_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sqlite_exact_module.SQLiteExactCollection, "_load_all_vectors", counting_load
+    )
+    # A write that does not say which ids it touched: the next search re-reads all.
+    with col._cursor(write=True) as cur:
+        cur.execute("UPDATE documents SET document = 'changed' WHERE id = 'a'")
+    col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert loads == [None]
     backend.close()

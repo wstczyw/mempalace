@@ -63,6 +63,12 @@ _WRITE_GENERATION_KEY = "write_generation"
 _WRITE_GENERATION_SQL = "SELECT value FROM meta WHERE key = ?"
 
 
+# Own-write journal: more changed ids than this since the cached matrix was built
+# means a full reload is cheaper than patching.
+_VECTOR_DELTA_MAX = 20000
+_VECTOR_JOURNAL_KEEP = 10000
+
+
 def _bump_write_generation(executor) -> None:
     """Advance the immutable-reader generation inside the open write transaction."""
     executor.execute(
@@ -497,9 +503,12 @@ class _SQLiteExactHandle:
         # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
         # by query() so a long-lived hub does not re-read every embedding blob
         # on the next search. Mini-metadata is wing/room/source_file for
-        # ``_vector_cache_data_version`` detects commits from other handles.
+        # ``_vector_stamp`` = (data_version, write_generation) the cache matches;
+        # a commit moves it and ``_sync_vector_cache`` patches or drops the cache.
         self._vector_cache: dict[int, tuple[list[str], np.ndarray, np.ndarray, list[dict]]] = {}
-        self._vector_cache_data_version: Optional[int] = None
+        self._vector_stamp: Optional[tuple[int, Optional[int]]] = None
+        # Ids named by the write in progress; None = the write did not say.
+        self._write_touched: Optional[set[str]] = None
         # collection_id -> name, so the background warmer can rebuild each entry.
         self._vector_cache_names: dict[int, str] = {}
         # Native accelerators share one versioned index per collection across
@@ -556,6 +565,8 @@ class SQLiteExactCollection(BaseCollection):
         serialization = self._write_lock() if write else self._handle.lock
         with serialization:
             self._ensure_open()
+            if write:
+                self._handle._write_touched = None
             cur = self._handle.conn.cursor()
             try:
                 yield cur
@@ -565,14 +576,33 @@ class SQLiteExactCollection(BaseCollection):
             else:
                 # No-op write cursors never start a transaction. Bumping them
                 # would drop a warm immutable snapshot that still matches disk.
+                generation = None
                 if write and self._handle.conn.in_transaction:
                     _bump_write_generation(cur)
-                self._handle.conn.commit()
+                    row = cur.execute(_WRITE_GENERATION_SQL, (_WRITE_GENERATION_KEY,)).fetchone()
+                    generation = int(row[0])
+                    # Before commit: a reader that sees the commit must find the entry.
+                    if self._backend is not None:
+                        self._backend._journal_add(
+                            self._handle.palace_path,
+                            generation,
+                            self._collection_name,
+                            self._handle._write_touched,
+                        )
+                try:
+                    self._handle.conn.commit()
+                except Exception:
+                    if generation is not None and self._backend is not None:
+                        self._backend._journal_discard(self._handle.palace_path, generation)
+                    raise
                 if write:
-                    self._handle._vector_cache.clear()
                     self._handle._native_cache.clear()
             finally:
                 cur.close()
+
+    def _touch(self, ids) -> None:
+        """Name the drawer ids this write changes so readers can patch, not reload."""
+        self._handle._write_touched = (self._handle._write_touched or set()) | set(ids)
 
     def _collection_id(self, cur) -> int:
         row = cur.execute(
@@ -648,6 +678,7 @@ class SQLiteExactCollection(BaseCollection):
         if not identity or not identity.model_name:
             return
         with self._cursor(write=True) as cur:
+            self._touch(())
             cur.execute(
                 "INSERT INTO meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -703,6 +734,7 @@ class SQLiteExactCollection(BaseCollection):
         )
         now = _utcnow()
         with self._cursor(write=True) as cur:
+            self._touch(ids)
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -747,6 +779,7 @@ class SQLiteExactCollection(BaseCollection):
         )
         now = _utcnow()
         with self._cursor(write=True) as cur:
+            self._touch(ids)
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -826,6 +859,7 @@ class SQLiteExactCollection(BaseCollection):
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
         documents, ids, metadatas = prepare_stored_write(documents, ids, metadatas)
         with self._cursor(write=True) as cur:
+            self._touch(ids)
             collection_id = self._collection_id(cur)
             if documents is None and embeddings is None:
                 # Metadata-only update (a wing or room move): merge the JSON
@@ -1058,7 +1092,9 @@ class SQLiteExactCollection(BaseCollection):
             except _SnapshotChanged:
                 with self._handle.lock:
                     self._handle._native_cache.pop(self._collection_name, None)
-                    self._handle._vector_cache.clear()
+                    # A live handle's stamp already tells the retry what changed.
+                    if self._handle.immutable:
+                        self._handle._vector_cache.clear()
         raise BackendError("Palace changed repeatedly during exact search; retry the query")
 
     def _query_once(
@@ -1177,10 +1213,7 @@ class SQLiteExactCollection(BaseCollection):
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
         empty_norms = np.zeros((0,), dtype=np.float32)
-        data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
-        if self._handle._vector_cache_data_version != data_version:
-            self._handle._vector_cache.clear()
-            self._handle._vector_cache_data_version = data_version
+        self._sync_vector_cache(cur)
         cached = self._handle._vector_cache.get(collection_id)
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
@@ -1209,21 +1242,109 @@ class SQLiteExactCollection(BaseCollection):
         idx = np.array(keep, dtype=np.intp)
         return [ids[i] for i in keep], mat[idx], norms[idx]
 
+    def _vector_stamp(self, cur) -> tuple[int, Optional[int]]:
+        """(data_version, write_generation); generation is None if it would not hold still."""
+        for _ in range(3):
+            first = cur.execute(_WRITE_GENERATION_SQL, (_WRITE_GENERATION_KEY,)).fetchone()
+            data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+            second = cur.execute(_WRITE_GENERATION_SQL, (_WRITE_GENERATION_KEY,)).fetchone()
+            if first == second:
+                return data_version, int(first[0]) if first else None
+        return data_version, None
+
+    def _sync_vector_cache(self, cur) -> None:
+        """Bring the cached matrices up to the database, patching when we can.
+
+        Commits this process made are journaled with the ids they touched, so a
+        search after one re-reads only those rows. Any other change (another
+        process, a write that did not say which ids, a gap in the journal) drops
+        the cache and the next load is a full read, as before.
+        """
+        handle = self._handle
+        stamp = self._vector_stamp(cur)
+        old = handle._vector_stamp
+        if stamp == old:
+            return
+        handle._vector_stamp = stamp
+        if old is None or not handle._vector_cache:
+            handle._vector_cache.clear()
+            return
+        changed = None
+        if stamp[1] is not None and old[1] is not None and stamp[1] > old[1]:
+            changed = self._backend and self._backend._journal_since(
+                handle.palace_path, old[1], stamp[1]
+            )
+        if changed is None or sum(len(ids) for _, ids in changed) > _VECTOR_DELTA_MAX:
+            handle._vector_cache.clear()
+            return
+        for collection_id in list(handle._vector_cache):
+            name = handle._vector_cache_names.get(collection_id)
+            ids = {i for coll, batch in changed if coll == name for i in batch}
+            if ids and not self._apply_vector_delta(cur, collection_id, ids):
+                handle._vector_cache.pop(collection_id, None)
+
+    def _apply_vector_delta(self, cur, collection_id: int, changed: set[str]) -> bool:
+        """Re-read ``changed`` rows and patch the cached matrix; False = drop the cache."""
+        handle = self._handle
+        ids, mat, norms, metas = handle._vector_cache[collection_id]
+        expected = self._collection_dimension(cur, collection_id)
+        ids_new, mat_new, norms_new, metas_new = self._load_all_vectors(
+            cur, collection_id, expected, only_ids=sorted(changed)
+        )
+        if mat.size and mat_new.size and mat.shape[1] != mat_new.shape[1]:
+            return False
+        position = {doc_id: i for i, doc_id in enumerate(ids)}
+        # shortcut: copies the whole matrix (~0.3 s for 320k rows) per patch and
+        # appends new drawers at the end; upgrade to a preallocated buffer if
+        # patches get frequent enough for the copy to show up.
+        mat, norms, metas = mat.copy(), norms.copy(), list(metas)
+        for j, doc_id in enumerate(ids_new):
+            i = position.get(doc_id)
+            if i is not None:
+                mat[i], norms[i], metas[i] = mat_new[j], norms_new[j], metas_new[j]
+        add = [j for j, doc_id in enumerate(ids_new) if doc_id not in position]
+        # Deleted rows, or rows whose vector no longer fits the dimension.
+        found = set(ids_new)
+        gone = {position[d] for d in changed if d in position and d not in found}
+        if gone or add:
+            keep = [i for i in range(len(ids)) if i not in gone]
+            ids = [ids[i] for i in keep] + [ids_new[j] for j in add]
+            metas = [metas[i] for i in keep] + [metas_new[j] for j in add]
+            if keep and add:
+                mat = np.concatenate((mat[keep], mat_new[add]))
+                norms = np.concatenate((norms[keep], norms_new[add]))
+            elif keep:
+                mat, norms = mat[keep], norms[keep]
+            else:
+                mat, norms = mat_new[add], norms_new[add]
+        handle._vector_cache[collection_id] = (ids, mat, norms, metas)
+        return True
+
     def _load_all_vectors(
-        self, cur, collection_id: int, expected: Optional[int]
+        self,
+        cur,
+        collection_id: int,
+        expected: Optional[int],
+        only_ids: Optional[list[str]] = None,
     ) -> tuple[list[str], np.ndarray, np.ndarray, list[dict]]:
         wing_expr = _json_field_sql("wing", locus_columns=self._handle.has_locus_columns)
         room_expr = _json_field_sql("room", locus_columns=self._handle.has_locus_columns)
-        rows = cur.execute(
-            f"""
+        select = f"""
             SELECT id, embedding, {wing_expr}, {room_expr},
                    json_extract(metadata_json, '$.source_file')
             FROM documents
             WHERE collection_id = ?
-            ORDER BY rowid
-            """,
-            (collection_id,),
-        ).fetchall()
+            """
+        if only_ids is None:
+            rows = cur.execute(select + "ORDER BY rowid", (collection_id,)).fetchall()
+        else:
+            rows = []
+            for start in range(0, len(only_ids), 900):
+                chunk = only_ids[start : start + 900]
+                marks = ",".join("?" for _ in chunk)
+                rows += cur.execute(
+                    select + f"AND id IN ({marks}) ORDER BY rowid", (collection_id, *chunk)
+                ).fetchall()
         ids: list[str] = []
         vecs: list[np.ndarray] = []
         metas: list[dict] = []
@@ -1424,6 +1545,7 @@ class SQLiteExactCollection(BaseCollection):
                 rows = self._rows(cur, where=where)
                 ids = [row["id"] for row in rows]
             target_ids = list(ids or [])
+            self._touch(target_ids)
             if not target_ids:
                 return
             fts_enabled = self._fts_available(cur)
@@ -1752,6 +1874,7 @@ class SQLiteExactCollection(BaseCollection):
         if kind == "analyze":
             # Refresh planner stats. Concurrent runs serialize on the handle lock.
             with self._cursor(write=True) as cur:
+                self._touch(())
                 cur.execute("ANALYZE")
             return MaintenanceResult(kind="analyze", status="ran")
 
@@ -1807,6 +1930,37 @@ class SQLiteExactBackend(BaseBackend):
         self._clients_lock = threading.RLock()
         self._closed = False
         self._warmer_started = False
+        # palace -> {write_generation: (collection name, touched ids | None)} for
+        # commits made by this process; lets a reader patch instead of reload.
+        self._journal: dict[str, dict[int, tuple[str, Optional[frozenset[str]]]]] = {}
+        self._journal_lock = threading.Lock()
+
+    @staticmethod
+    def _journal_key(palace_path: str) -> str:
+        return os.path.normcase(os.path.abspath(palace_path))
+
+    def _journal_add(
+        self, palace_path: str, generation: int, collection: str, ids: Optional[set[str]]
+    ) -> None:
+        with self._journal_lock:
+            entries = self._journal.setdefault(self._journal_key(palace_path), {})
+            entries[generation] = (collection, None if ids is None else frozenset(ids))
+            if len(entries) > 2 * _VECTOR_JOURNAL_KEEP:
+                for old in sorted(entries)[:-_VECTOR_JOURNAL_KEEP]:
+                    del entries[old]
+
+    def _journal_discard(self, palace_path: str, generation: int) -> None:
+        with self._journal_lock:
+            self._journal.get(self._journal_key(palace_path), {}).pop(generation, None)
+
+    def _journal_since(self, palace_path: str, after: int, upto: int):
+        """[(collection, ids)] for generations after+1..upto, or None if any is unknown."""
+        with self._journal_lock:
+            entries = self._journal.get(self._journal_key(palace_path), {})
+            found = [entries.get(gen) for gen in range(after + 1, upto + 1)]
+        if any(entry is None or entry[1] is None for entry in found):
+            return None
+        return found
 
     def _start_vector_warmer(self) -> None:
         with self._clients_lock:
@@ -1818,7 +1972,7 @@ class SQLiteExactBackend(BaseBackend):
         ).start()
 
     def _warm_vector_caches_loop(self) -> None:
-        # shortcut: polls PRAGMA data_version every 2 s and reloads the cached vector matrix right after another connection commits, so a search does not pay the full reload; a reload that starts with cold file cache still takes 20-30 s, upgrade to incremental refresh if that shows up.
+        # shortcut: polls every 2 s and patches (own commits) or reloads (anyone else's) the cached vector matrix right after a commit, so a search does not pay for it; a full reload that starts with cold file cache still takes 20-30 s.
         while not self._closed:
             time.sleep(2)
             try:
@@ -1834,17 +1988,15 @@ class SQLiteExactBackend(BaseBackend):
                 if handle.closed or not handle._vector_cache_names:
                     continue
                 cur = handle.conn.cursor()
-                data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
-                if data_version == handle._vector_cache_data_version:
-                    continue
-                handle._vector_cache.clear()
-                handle._vector_cache_data_version = data_version
-                for collection_id, name in list(handle._vector_cache_names.items()):
-                    coll = SQLiteExactCollection(handle, name, self)
-                    expected = coll._collection_dimension(cur, collection_id)
-                    handle._vector_cache[collection_id] = coll._load_all_vectors(
-                        cur, collection_id, expected
-                    )
+                names = list(handle._vector_cache_names.items())
+                SQLiteExactCollection(handle, names[0][1], self)._sync_vector_cache(cur)
+                for collection_id, name in names:
+                    if collection_id not in handle._vector_cache:
+                        coll = SQLiteExactCollection(handle, name, self)
+                        expected = coll._collection_dimension(cur, collection_id)
+                        handle._vector_cache[collection_id] = coll._load_all_vectors(
+                            cur, collection_id, expected
+                        )
 
     @staticmethod
     def _db_path(palace_path: str) -> str:
