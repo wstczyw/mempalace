@@ -2362,11 +2362,18 @@ def test_own_writes_patch_vector_cache_without_full_reload(tmp_path, monkeypatch
     col.add(ids=["d"], documents=["delta"], metadatas=[{"wing": "x"}], embeddings=[[-1.0, 0.0]])
     col.upsert(ids=["b"], documents=["beta2"], metadatas=[{"wing": "x"}], embeddings=[[1.0, 0.1]])
     col.update(ids=["c"], metadatas=[{"wing": "x"}])
-    col.delete(ids=["a"])
 
-    assert ranking(reader) == ["b", "c", "d"]
+    buffer_before = next(iter(reader._handle._vector_cache.values()))[1].base
+    assert ranking(reader) == ["a", "b", "c", "d"]
     assert ranking(reader, where={"wing": "x"}) == ["b", "c", "d"]
     assert len(full) == 1 and partial  # patched, not re-read
+    # The matrix grew inside the spare rows left by the first load: no copy.
+    assert next(iter(reader._handle._vector_cache.values()))[1].base is buffer_before
+
+    # A delete would need the matrix compacted, so that one reloads.
+    col.delete(ids=["a"])
+    assert ranking(reader) == ["b", "c", "d"]
+    assert len(full) == 2
 
     fresh = SQLiteExactBackend()
     fresh_col = fresh.get_collection(

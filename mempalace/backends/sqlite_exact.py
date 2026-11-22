@@ -67,6 +67,8 @@ _WRITE_GENERATION_SQL = "SELECT value FROM meta WHERE key = ?"
 # means a full reload is cheaper than patching.
 _VECTOR_DELTA_MAX = 20000
 _VECTOR_JOURNAL_KEEP = 10000
+# Spare rows allocated behind a freshly loaded matrix (~25 MB at 768 dims).
+_VECTOR_HEADROOM = 8192
 
 
 def _bump_write_generation(executor) -> None:
@@ -79,6 +81,31 @@ def _bump_write_generation(executor) -> None:
         """,
         (_WRITE_GENERATION_KEY,),
     )
+
+
+def _grow_rows(mat: np.ndarray, norms: np.ndarray, extra: int, dim: int):
+    """Return (mat, norms) with ``extra`` more rows; copies only without headroom."""
+    n = mat.shape[0]
+
+    def room(view: np.ndarray, rows: int) -> Optional[np.ndarray]:
+        base = view.base
+        if (
+            isinstance(base, np.ndarray)
+            and base.shape[0] >= rows
+            and base.shape[1:] == view.shape[1:]
+            and base.__array_interface__["data"][0] == view.__array_interface__["data"][0]
+        ):
+            return base[:rows]
+        return None
+
+    grown, grown_norms = room(mat, n + extra), room(norms, n + extra)
+    if grown is not None and grown_norms is not None:
+        return grown, grown_norms
+    buffer = np.empty((n + extra + _VECTOR_HEADROOM, dim), dtype=np.float32)
+    buffer[:n] = mat
+    norm_buffer = np.empty(n + extra + _VECTOR_HEADROOM, dtype=np.float32)
+    norm_buffer[:n] = norms
+    return buffer[: n + extra], norm_buffer[: n + extra]
 
 
 def _json_dumps(obj: Any) -> str:
@@ -1280,13 +1307,22 @@ class SQLiteExactCollection(BaseCollection):
         for collection_id in list(handle._vector_cache):
             name = handle._vector_cache_names.get(collection_id)
             ids = {i for coll, batch in changed if coll == name for i in batch}
-            if ids and not self._apply_vector_delta(cur, collection_id, ids):
+            try:
+                patched = not ids or self._apply_vector_delta(cur, collection_id, ids)
+            except Exception:
+                logger.debug("sqlite_exact vector patch failed; reloading", exc_info=True)
+                patched = False
+            if not patched:
                 handle._vector_cache.pop(collection_id, None)
 
     def _apply_vector_delta(self, cur, collection_id: int, changed: set[str]) -> bool:
-        """Re-read ``changed`` rows and patch the cached matrix; False = drop the cache."""
-        handle = self._handle
-        ids, mat, norms, metas = handle._vector_cache[collection_id]
+        """Re-read ``changed`` rows and patch the cached matrix in place.
+
+        False = drop the cache (full reload). The matrix is ~1 GB, so nothing
+        here copies it unless the headroom left by the last load is used up.
+        Callers hold the handle lock, so no search is reading the arrays.
+        """
+        ids, mat, norms, metas = self._handle._vector_cache[collection_id]
         expected = self._collection_dimension(cur, collection_id)
         ids_new, mat_new, norms_new, metas_new = self._load_all_vectors(
             cur, collection_id, expected, only_ids=sorted(changed)
@@ -1294,30 +1330,24 @@ class SQLiteExactCollection(BaseCollection):
         if mat.size and mat_new.size and mat.shape[1] != mat_new.shape[1]:
             return False
         position = {doc_id: i for i, doc_id in enumerate(ids)}
-        # shortcut: copies the whole matrix (~0.3 s for 320k rows) per patch and
-        # appends new drawers at the end; upgrade to a preallocated buffer if
-        # patches get frequent enough for the copy to show up.
-        mat, norms, metas = mat.copy(), norms.copy(), list(metas)
+        found = set(ids_new)
+        # shortcut: a deleted row (or one whose vector no longer fits) would need
+        # the matrix compacted; reload instead, deletes are rare.
+        if any(d in position and d not in found for d in changed):
+            return False
+        add = [j for j, doc_id in enumerate(ids_new) if doc_id not in position]
+        n = len(ids)
+        if add:
+            mat, norms = _grow_rows(mat, norms, len(add), mat_new.shape[1])
         for j, doc_id in enumerate(ids_new):
             i = position.get(doc_id)
             if i is not None:
                 mat[i], norms[i], metas[i] = mat_new[j], norms_new[j], metas_new[j]
-        add = [j for j, doc_id in enumerate(ids_new) if doc_id not in position]
-        # Deleted rows, or rows whose vector no longer fits the dimension.
-        found = set(ids_new)
-        gone = {position[d] for d in changed if d in position and d not in found}
-        if gone or add:
-            keep = [i for i in range(len(ids)) if i not in gone]
-            ids = [ids[i] for i in keep] + [ids_new[j] for j in add]
-            metas = [metas[i] for i in keep] + [metas_new[j] for j in add]
-            if keep and add:
-                mat = np.concatenate((mat[keep], mat_new[add]))
-                norms = np.concatenate((norms[keep], norms_new[add]))
-            elif keep:
-                mat, norms = mat[keep], norms[keep]
-            else:
-                mat, norms = mat_new[add], norms_new[add]
-        handle._vector_cache[collection_id] = (ids, mat, norms, metas)
+        for offset, j in enumerate(add):
+            mat[n + offset], norms[n + offset] = mat_new[j], norms_new[j]
+            ids.append(ids_new[j])
+            metas.append(metas_new[j])
+        self._handle._vector_cache[collection_id] = (ids, mat, norms, metas)
         return True
 
     def _load_all_vectors(
@@ -1371,8 +1401,15 @@ class SQLiteExactCollection(BaseCollection):
                 np.zeros((0,), dtype=np.float32),
                 metas,
             )
-        mat = np.stack(vecs)
-        norms = np.linalg.norm(mat, axis=1)
+        # A full load leaves spare rows behind the matrix so later patches append
+        # in place; see ``_grow_rows``.
+        spare = _VECTOR_HEADROOM if only_ids is None else 0
+        buffer = np.empty((len(vecs) + spare, vecs[0].size), dtype=np.float32)
+        mat = buffer[: len(vecs)]
+        np.stack(vecs, out=mat)
+        norm_buffer = np.empty(len(vecs) + spare, dtype=np.float32)
+        norms = norm_buffer[: len(vecs)]
+        norms[:] = np.linalg.norm(mat, axis=1)
         return ids, mat, norms, metas
 
     def _hydrate(self, cur, collection_id: int, ids: list[str], spec) -> tuple[dict, dict]:
