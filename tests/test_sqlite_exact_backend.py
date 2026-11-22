@@ -2418,6 +2418,9 @@ def test_lexical_search_skips_stop_words_unless_nothing_else_is_left(tmp_path):
     )
     # The stop words are dropped from the FTS query, so only the rare term decides.
     assert [h.id for h in col.lexical_search(query="the and zebra").hits] == ["b"]
+    # Long queries keep their longest words, so the rare one still decides.
+    filler = " ".join(f"word{i:02d}" for i in range(12))
+    assert [h.id for h in col.lexical_search(query=f"crossed {filler}").hits] == ["b"]
     # A query made only of stop words still searches, as before.
     assert [h.id for h in col.lexical_search(query="the and").hits] == ["a"]
     backend.close()

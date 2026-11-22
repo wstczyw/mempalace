@@ -69,6 +69,8 @@ _VECTOR_DELTA_MAX = 20000
 _VECTOR_JOURNAL_KEEP = 10000
 # Spare rows allocated behind a freshly loaded matrix (~25 MB at 768 dims).
 _VECTOR_HEADROOM = 8192
+# Most tokens a full-text query may carry; each common one walks a long posting list.
+_FTS_MAX_TOKENS = 8
 
 
 def _bump_write_generation(executor) -> None:
@@ -1799,7 +1801,11 @@ class SQLiteExactCollection(BaseCollection):
         if not self._fts_available(cur):
             return None
         tokens = [t for t in tokenize(query) if len(t) >= 2]
-        tokens = [t for t in tokens if t not in FTS_STOP_WORDS] or tokens
+        # shortcut: keeps the 8 longest non-stop tokens (longer words are rarer, so
+        # cheaper to match); upgrade to document-frequency based picking if recall quality asks.
+        useful = [t for t in dict.fromkeys(tokens) if t not in FTS_STOP_WORDS]
+        useful = [t for t in useful if not (t.isascii() and len(t) < 3)]
+        tokens = sorted(useful, key=len, reverse=True)[:_FTS_MAX_TOKENS] or tokens
         if not tokens:
             return None
         fts_query = " OR ".join(tokens)
