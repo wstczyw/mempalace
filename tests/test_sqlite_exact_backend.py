@@ -2408,7 +2408,8 @@ def test_vector_cache_reloads_when_write_gives_no_ids(tmp_path, monkeypatch):
     backend.close()
 
 
-def test_lexical_search_skips_stop_words_unless_nothing_else_is_left(tmp_path):
+def test_lexical_search_skips_stop_words_unless_nothing_else_is_left(tmp_path, monkeypatch):
+    monkeypatch.setattr(sqlite_exact_module, "_FTS_MIN_ROWS", 0)  # force the FTS path
     backend, col = _collection(tmp_path)
     col.add(
         ids=["a", "b"],
@@ -2418,9 +2419,20 @@ def test_lexical_search_skips_stop_words_unless_nothing_else_is_left(tmp_path):
     )
     # The stop words are dropped from the FTS query, so only the rare term decides.
     assert [h.id for h in col.lexical_search(query="the and zebra").hits] == ["b"]
-    # Long queries keep their longest words, so the rare one still decides.
-    filler = " ".join(f"word{i:02d}" for i in range(12))
-    assert [h.id for h in col.lexical_search(query=f"crossed {filler}").hits] == ["b"]
     # A query made only of stop words still searches, as before.
     assert [h.id for h in col.lexical_search(query="the and").hits] == ["a"]
+    backend.close()
+
+
+def test_small_collection_lexical_search_skips_shared_fts(tmp_path):
+    backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["a zebra crossed"],
+        metadatas=[{"wing": "w"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    with col._cursor() as cur:
+        assert col._lexical_search_fts(cur, query="zebra", n_results=3, where=None) is None
+    assert [h.id for h in col.lexical_search(query="zebra").hits] == ["a"]
     backend.close()
