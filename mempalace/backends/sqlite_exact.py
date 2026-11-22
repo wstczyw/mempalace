@@ -1333,10 +1333,17 @@ class SQLiteExactCollection(BaseCollection):
             return False
         position = {doc_id: i for i, doc_id in enumerate(ids)}
         found = set(ids_new)
-        # shortcut: a deleted row (or one whose vector no longer fits) would need
-        # the matrix compacted; reload instead, deletes are rare.
-        if any(d in position and d not in found for d in changed):
-            return False
+        # Gone rows (also rows whose vector no longer fits): the last row moves into the
+        # hole, so nothing is copied; row order only breaks ties between equal scores.
+        for doc_id in [d for d in changed if d in position and d not in found]:
+            i, last = position.pop(doc_id), len(ids) - 1
+            if i != last:
+                ids[i], metas[i] = ids[last], metas[last]
+                mat[i], norms[i] = mat[last], norms[last]
+                position[ids[i]] = i
+            ids.pop()
+            metas.pop()
+            mat, norms = mat[:last], norms[:last]
         add = [j for j, doc_id in enumerate(ids_new) if doc_id not in position]
         n = len(ids)
         if add:

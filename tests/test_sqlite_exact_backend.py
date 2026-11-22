@@ -2370,10 +2370,11 @@ def test_own_writes_patch_vector_cache_without_full_reload(tmp_path, monkeypatch
     # The matrix grew inside the spare rows left by the first load: no copy.
     assert next(iter(reader._handle._vector_cache.values()))[1].base is buffer_before
 
-    # A delete would need the matrix compacted, so that one reloads.
+    # A delete moves the last row into the hole: patched too, still no full reload.
     col.delete(ids=["a"])
-    assert ranking(reader) == ["b", "c", "d"]
-    assert len(full) == 2
+    assert sorted(ranking(reader)) == ["b", "c", "d"]
+    assert sorted(ranking(reader, where={"wing": "x"})) == ["b", "c", "d"]
+    assert len(full) == 1
 
     fresh = SQLiteExactBackend()
     fresh_col = fresh.get_collection(
