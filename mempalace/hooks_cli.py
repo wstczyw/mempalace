@@ -60,6 +60,10 @@ SAVE_INTERVAL = 100
 _DIARY_WAIT_SECS = 30
 _STOP_DIARY_WAIT_DEFAULT_SECS = 2.0
 _STOP_DIARY_WAIT_ENV = "MEMPALACE_HOOK_DIARY_WAIT_SECS"
+# A live daemon can miss the 0.15s hook probe (Windows paged out its idle memory,
+# or a burst of hooks queued on it; seen at 0.15-1.2s). Under ``require`` that
+# false "unavailable" skips the save, so the probe gets one patient retry.
+_REQUIRE_PROBE_RETRY_SECS = 2.0
 _PENDING_DIARY_NAME = "pending_diary.jsonl"
 _PENDING_DIARY_GUARD = threading.Lock()
 STATE_DIR = paths.state_path("hook_state")
@@ -566,7 +570,7 @@ def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
     return f"hook:mine:{mode}:{source_key}"
 
 
-def _daemon_available() -> bool:
+def _daemon_available(health_timeout: Optional[float] = None) -> bool:
     """True iff a daemon is already running for the configured palace.
 
     This is a fast localhost health check, not a spawn: the hook time budget
@@ -577,7 +581,10 @@ def _daemon_available() -> bool:
 
     try:
         return (
-            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+            get_client_if_running(
+                MempalaceConfig().palace_path,
+                health_timeout=health_timeout or HOOK_PROBE_TIMEOUT,
+            )
             is not None
         )
     except Exception:
@@ -673,6 +680,14 @@ def _compute_hook_write_routing() -> HookWriteRouting:
     daemon_available = False
     if resolved.policy is not WriteRoutingPolicy.DIRECT:
         daemon_available = _daemon_available()
+        if not daemon_available and resolved.policy is WriteRoutingPolicy.REQUIRE:
+            # No endpoint / dead pid / refused port still fail in milliseconds;
+            # only a live-but-slow daemon spends the extra wait.
+            daemon_available = _daemon_available(_REQUIRE_PROBE_RETRY_SECS)
+            if daemon_available:
+                _log(
+                    "Hook daemon probe: missed the fast check, answered the retry; write not blocked"
+                )
 
     decision = choose_write_route(
         resolved.policy,

@@ -4,7 +4,7 @@ import json
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -328,7 +328,7 @@ def test_require_unavailable_blocks_every_direct_hook_write_path(
 
             hooks_cli._ingest_transcript(str(transcript))
 
-    probe.assert_called_once_with()
+    assert probe.call_args_list == [call(), call(hooks_cli._REQUIRE_PROBE_RETRY_SECS)]
     submit.assert_not_called()
     spawn.assert_not_called()
     sync_run.assert_not_called()
@@ -607,3 +607,31 @@ def test_stop_uses_one_daemon_probe_for_all_write_helpers(
 
     probe.assert_called_once_with()
     assert "checkpoint saved" in output["systemMessage"]
+
+
+@pytest.mark.parametrize(
+    ("policy", "probes", "expected_calls", "use_daemon"),
+    [
+        (WriteRoutingPolicy.REQUIRE, [False, True], 2, True),
+        (WriteRoutingPolicy.REQUIRE, [False, False], 2, False),
+        (WriteRoutingPolicy.PREFER, [False], 1, False),
+    ],
+)
+def test_require_retries_a_slow_daemon_probe_before_blocking(
+    policy, probes, expected_calls, use_daemon
+):
+    """A live daemon that misses the 0.15s probe must not cost a require-mode save."""
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig", return_value=_HookConfig(policy)),
+        patch("mempalace.hooks_cli._daemon_available", side_effect=probes) as probe,
+        patch("mempalace.hooks_cli._log") as log,
+    ):
+        with hooks_cli._hook_write_routing_context() as routing:
+            assert routing.use_daemon is use_daemon
+            assert routing.blocked is (policy is WriteRoutingPolicy.REQUIRE and not use_daemon)
+
+    assert probe.call_count == expected_calls
+    if expected_calls == 2:
+        assert probe.call_args_list[1] == call(hooks_cli._REQUIRE_PROBE_RETRY_SECS)
+    rescued = any("answered the retry" in str(c) for c in log.call_args_list)
+    assert rescued is (expected_calls == 2 and use_daemon)

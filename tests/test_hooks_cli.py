@@ -1001,6 +1001,76 @@ def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
     assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
+def test_daemon_available_retry_timeout_reaches_a_slow_live_daemon(tmp_path, monkeypatch):
+    """The hook's 0.15s probe misses a daemon that answers in 0.4s; the retry timeout catches it."""
+    import socket
+    import threading
+    import time
+
+    from mempalace import daemon
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "daemon-state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)
+    port = server.getsockname()[1]
+    body = b'{"ok": true}'
+
+    def _slow_reply(conn):
+        with conn:
+            conn.recv(65536)
+            time.sleep(0.4)
+            try:
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body
+                )
+            except OSError:
+                pass  # the 0.15s prober already hung up
+
+    def _serve():
+        while True:
+            try:
+                conn, _addr = server.accept()
+            except OSError:
+                return
+            threading.Thread(target=_slow_reply, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    try:
+        daemon.ensure_token(str(palace))
+        (daemon.state_dir(str(palace)) / "endpoint.json").write_text(
+            json.dumps({"host": "127.0.0.1", "port": port, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+        fast = hooks_cli_mod._daemon_available()
+        patient = hooks_cli_mod._daemon_available(hooks_cli_mod._REQUIRE_PROBE_RETRY_SECS)
+    finally:
+        server.close()
+
+    assert fast is False
+    assert patient is True
+
+
+def test_daemon_available_retry_is_instant_when_no_daemon(tmp_path, monkeypatch):
+    import time
+
+    from mempalace import daemon
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "daemon-state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    started = time.perf_counter()
+    available = hooks_cli_mod._daemon_available(hooks_cli_mod._REQUIRE_PROBE_RETRY_SECS)
+    assert available is False
+    assert time.perf_counter() - started < 0.5
+
+
 def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
     transcript = tmp_path / "session.jsonl"
     palace_dir = tmp_path / "palace"
