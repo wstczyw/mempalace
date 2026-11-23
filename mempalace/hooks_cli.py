@@ -61,9 +61,10 @@ _DIARY_WAIT_SECS = 30
 _STOP_DIARY_WAIT_DEFAULT_SECS = 2.0
 _STOP_DIARY_WAIT_ENV = "MEMPALACE_HOOK_DIARY_WAIT_SECS"
 # A live daemon can miss the 0.15s hook probe (Windows paged out its idle memory,
-# or a burst of hooks queued on it; seen at 0.15-1.2s). Under ``require`` that
-# false "unavailable" skips the save, so the probe gets one patient retry.
-_REQUIRE_PROBE_RETRY_SECS = 2.0
+# a burst of hooks queued on it, or a big mine loading the machine; seen at
+# 0.15-3.6s). Under ``require`` that false "unavailable" skips the save, so the
+# probe gets one patient retry. Only a live-but-slow daemon pays this wait.
+_REQUIRE_PROBE_RETRY_SECS = 5.0
 _PENDING_DIARY_NAME = "pending_diary.jsonl"
 _PENDING_DIARY_GUARD = threading.Lock()
 STATE_DIR = paths.state_path("hook_state")
