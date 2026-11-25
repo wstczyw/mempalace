@@ -1791,6 +1791,27 @@ _WORKTREE_CWD_MARKERS = ("/.claude/worktrees/", "/.worktrees/")
 _WORKTREE_ENCODED_MARKERS = ("-claude-worktrees-", "--worktrees-")
 
 
+# Orca (虎鲸) workspaces: ``<home>/orca/workspaces/<repo>/<workspace>[/...]`` collapse to
+# ``.../<repo>`` (the repo's main checkout files under the same name); otherwise every workspace
+# directory name (``eel``, ``stingaree-2``) becomes its own wing.
+_ORCA_WORKSPACE_CWD = re.compile(r"(?i)^(.*/orca/workspaces/[^/]+)/[^/]+(?:/.*)?$")
+# Orca bot homes ``<home>/.orca/bots/bot`` and ``.../bot-<n>`` are named in their ``bot.json``;
+# other bot homes (shift, barca, ...) keep their directory name.
+_ORCA_BOT_CWD = re.compile(r"(?i)^(.*/\.orca/bots/(bot(?:-\d+)?))(?:/.*)?$")
+
+
+def _orca_bot_wing(cwd_norm: str) -> Optional[str]:
+    """The ``bot.json`` name of a numbered Orca bot home (``bot``, ``bot-2``), else ``None``."""
+    m = _ORCA_BOT_CWD.match(cwd_norm)
+    if not m:
+        return None
+    try:
+        name = json.loads(Path(m.group(1), "bot.json").read_text(encoding="utf-8")).get("name")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return _wing_slug(name) if isinstance(name, str) and name.strip() else None
+
+
 def _wing_slug(name: str) -> str:
     """The project wing for a directory name; ``sessions`` when nothing is left."""
     return normalize_wing_name(name) or "sessions"
@@ -1841,6 +1862,8 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
                     if _wt_marker in cwd_norm:
                         cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
                         break
+                # An Orca workspace "<home>/orca/workspaces/<repo>/<ws>" belongs to <repo>.
+                cwd_norm = _ORCA_WORKSPACE_CWD.sub(lambda m: m.group(1), cwd_norm)
                 return cwd_norm
     except OSError:
         pass
@@ -1852,6 +1875,9 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     cwd_norm = _cwd_from_jsonl(transcript_path)
     if not cwd_norm:
         return None
+    bot_wing = _orca_bot_wing(cwd_norm)
+    if bot_wing:
+        return bot_wing
     project = cwd_norm.rsplit("/", 1)[-1]
     if project:
         return _wing_slug(project)

@@ -3225,6 +3225,38 @@ def test_project_wing_collapses_worktrees_and_hyphens(tmp_path):
     assert _project_wing(path) == "acme_app"
 
 
+@pytest.mark.parametrize(
+    "cwd, wing",
+    [
+        ("C:\\Users\\me\\orca\\workspaces\\hermes\\stingaree-2", "hermes"),
+        ("C:/Users/me/orca/workspaces/hermes/eel/tools/x", "hermes"),
+        ("C:/Users/me/orca/workspaces/fin-intake/cerith", "fin_intake"),
+        ("C:/Users/me/orca/workspaces/hermes", "hermes"),  # no workspace segment: unchanged
+        ("D:/hermes/releases/tms", "tms"),
+    ],
+)
+def test_project_wing_collapses_orca_workspaces_to_the_repo(tmp_path, cwd, wing):
+    from mempalace.hooks_cli import _project_wing
+
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, cwd)) == wing
+
+
+def test_project_wing_names_numbered_orca_bots_from_bot_json(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    bots = tmp_path / ".orca" / "bots"
+    for d, name in (("bot", "资金系统"), ("bot-2", "数据库分析"), ("shift", "运维工具")):
+        (bots / d).mkdir(parents=True)
+        (bots / d / "bot.json").write_text(json.dumps({"name": name}, ensure_ascii=False), encoding="utf-8")
+    (bots / "bot-3").mkdir()  # no bot.json: keep the directory name
+    wing = lambda d: _project_wing(_write_transcript_with_cwd(tmp_path, (bots / d).as_posix()))  # noqa: E731
+    assert wing("bot") == "资金系统"
+    assert wing("bot-2") == "数据库分析"
+    assert wing("bot-3") == "bot_3"
+    assert wing("shift") == "shift"  # only bot and bot-<n> are renamed
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, (bots / "bot-2" / "memory").as_posix())) == "数据库分析"
+
+
 def test_project_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
     from mempalace import hooks_cli
 
