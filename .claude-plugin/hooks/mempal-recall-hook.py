@@ -197,6 +197,8 @@ def _log(outcome: str, started: float) -> None:
 
 
 def main() -> int:
+    if os.environ.get("MEMPALACE_RECALL_DISABLE") == "1":
+        return 0  # per-project opt-out: set in that project's .claude/settings.json env
     try:
         prompt = str(json.load(sys.stdin).get("prompt") or "")
     except Exception:

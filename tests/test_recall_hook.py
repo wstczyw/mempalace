@@ -49,3 +49,15 @@ def test_hits_skip_diary_echo_and_duplicates(monkeypatch):
     monkeypatch.setattr(hook, "_search", lambda query, limit=3: results)
     hits = hook._hits("钉钉叫醒要不要改回原生事件？")
     assert [h["text"] for h in hits] == [answer]
+
+
+def test_disable_env_skips_before_reading_hub(monkeypatch, capsys):
+    monkeypatch.setenv("MEMPALACE_RECALL_DISABLE", "1")
+
+    def boom(_prompt):
+        raise AssertionError("hub must not be queried when disabled")
+
+    monkeypatch.setattr(hook, "_hits", boom)
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO('{"prompt": "上次为什么这样定"}'))
+    assert hook.main() == 0
+    assert capsys.readouterr().out == ""
