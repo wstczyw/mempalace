@@ -31,6 +31,13 @@ QUESTION_PENALTY = 0.05  # another ask (quoted prompt, request) ranks below a st
 MIN_PROSE = 40  # chars of real prose a hit needs once tool output and chrome are gone
 SNIPPET_CHARS = 240
 QUERY_CHARS = 250  # mempalace_search rejects longer queries ("must be at most 250 characters")
+# Wings kept out of auto-recall; mempalace_search with wing=<name> still finds them.
+# people: colleague cards from the Obsidian 70-People folder, searched on purpose only.
+EXCLUDED_WINGS = frozenset(
+    w.strip()
+    for w in os.environ.get("MEMPALACE_RECALL_EXCLUDE_WINGS", "people").split(",")
+    if w.strip()
+)
 # Questions about the past: where recall changes the first action.
 TRIGGER = re.compile(
     r"上次|之前|以前|当时|先例|历史|记得|为什么|为啥|根因|怎么做的|原来|裁定|决定过|老办法|又出现|又坏"
@@ -148,6 +155,8 @@ def _hits(prompt: str) -> list:
     ranked = []
     for hit in _search(query, CANDIDATES):
         if not isinstance(hit, dict) or str(hit.get("room") or "") == "diary":
+            continue
+        if str(hit.get("wing") or "") in EXCLUDED_WINGS:
             continue
         raw = str(hit.get("text") or hit.get("content") or hit.get("document") or "")
         # Drop sentences that only repeat the question being asked.

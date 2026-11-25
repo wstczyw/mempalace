@@ -51,6 +51,18 @@ def test_hits_skip_diary_echo_and_duplicates(monkeypatch):
     assert [h["text"] for h in hits] == [answer]
 
 
+def test_hits_skip_excluded_people_wing(monkeypatch):
+    kept = "结论：先查名册再派工，这条规矩在 operating-model 里有原文，照做即可，不用另问。"
+    results = [
+        {"wing": "people", "room": "general", "similarity": 0.99, "text": "同事视角卡的正文，" * 6},
+        {"wing": "hermes", "room": "technical", "similarity": 0.70, "text": kept},
+    ]
+    monkeypatch.setattr(hook, "_search", lambda query, limit=3: results)
+    hits = hook._hits("上次怎么派工的？")
+    assert [h["text"] for h in hits] == [kept]
+    assert "people" in hook.EXCLUDED_WINGS
+
+
 def test_disable_env_skips_before_reading_hub(monkeypatch, capsys):
     monkeypatch.setenv("MEMPALACE_RECALL_DISABLE", "1")
 
